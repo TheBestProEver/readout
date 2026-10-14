@@ -1,13 +1,13 @@
 /* Readout service worker: works offline after the first visit. Bump VERSION on each release. */
-const VERSION = 'v1';
+const VERSION = 'v2';
 const SHELL_CACHE = `readout-shell-${VERSION}`;
 const RUNTIME_CACHE = 'readout-runtime';
 const SHELL = [
   './',
   'index.html',
-  'styles.css?v=1',
-  'core.js?v=1',
-  'app.js?v=1',
+  'styles.css?v=2',
+  'core.js?v=2',
+  'app.js?v=2',
   'manifest.webmanifest',
   'icons/icon.svg',
   'icons/icon-192.png',

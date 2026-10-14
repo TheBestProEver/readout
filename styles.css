@@ -643,6 +643,25 @@ button { cursor: pointer; }
   text-overflow: ellipsis;
 }
 
+.input {
+  flex: 1;
+  min-width: 0;
+  height: 42px;
+  padding: 0 12px;
+  border: 1px solid var(--rule-strong);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--ink);
+}
+.input::placeholder { color: var(--ink-read); }
+
+.steps { margin: 0 0 12px; padding-left: 22px; color: var(--ink-2); }
+.steps li { margin: 6px 0; }
+.steps a { color: var(--pen); font-weight: 500; }
+.sync-confirm { margin-top: 12px; padding: 12px; border-radius: 12px; background: var(--sunk); }
+.sync-confirm .group-desc { margin-top: 0; color: var(--ink); }
+.sync-off { margin-top: 8px; padding: 0 8px; color: var(--ink-2); }
+
 .menu { display: grid; gap: 2px; padding-bottom: 4px; }
 .menu-item {
   display: flex;

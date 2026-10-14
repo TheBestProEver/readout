@@ -339,6 +339,11 @@
     return !!d && typeof d.id === 'string' && d.id.length > 0 && typeof d.text === 'string';
   }
 
+  // When a doc last changed in any way that syncs (text, title, pin).
+  function docStamp(d) {
+    return Number(d && d.changedAt) || Number(d && d.updatedAt) || 0;
+  }
+
   function mergeDocs(existing, incoming) {
     const byId = new Map(existing.map((d) => [d.id, d]));
     let added = 0;
@@ -354,16 +359,333 @@
         updatedAt: Number(raw.updatedAt) || Date.now(),
         pinned: !!raw.pinned,
       };
+      if (Number(raw.changedAt)) d.changedAt = Number(raw.changedAt);
+      if (raw.vv) d.vv = cleanVV(raw.vv);
+      if (raw.tv) d.tv = cleanVV(raw.tv);
+      if (Number(raw.pinAt)) d.pinAt = Number(raw.pinAt);
+      if (Number(raw.titleAt)) d.titleAt = Number(raw.titleAt);
       const cur = byId.get(d.id);
       if (!cur) {
         byId.set(d.id, d);
         added++;
-      } else if (d.updatedAt > (cur.updatedAt || 0)) {
+      } else if (docStamp(d) > docStamp(cur)) {
         byId.set(d.id, d);
         updated++;
       }
     }
     return { docs: Array.from(byId.values()), added, updated };
+  }
+
+  /* ---------- sync ---------- */
+
+  // The synced library lives in a few files: one index (reading positions and
+  // deletions) and up to 16 shards of texts, so a gist never needs more than 17 files.
+  const SYNC_SCHEMA = 1;
+  const SYNC_INDEX = 'readout-index.json';
+  const SYNC_SHARD = /^readout-docs-[0-9a-f]\.json$/;
+
+  function isSyncFile(name) {
+    return name === SYNC_INDEX || SYNC_SHARD.test(name);
+  }
+
+  function hash32(str) {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < str.length; i++) {
+      h ^= str.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    return h >>> 0;
+  }
+
+  function shardName(id) {
+    return 'readout-docs-' + (hash32(id) % 16).toString(16) + '.json';
+  }
+
+  /*
+   * Version vectors: { deviceId: number of changes made there }. They tell
+   * "this version already includes that one" apart from "both changed at once",
+   * without trusting device clocks. Each doc has two: vv counts every change,
+   * tv counts only changes to the text.
+   */
+  function cleanVV(vv) {
+    const out = {};
+    if (vv && typeof vv === 'object') {
+      for (const k of Object.keys(vv).sort()) {
+        const n = Math.floor(Number(vv[k]));
+        if (n > 0) out[k] = n;
+      }
+    }
+    return out;
+  }
+
+  // 0: same, 1: a includes b, -1: b includes a, 2: changed separately.
+  function compareVV(a, b) {
+    let more = false;
+    let less = false;
+    for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) {
+      const x = a[k] || 0;
+      const y = b[k] || 0;
+      if (x > y) more = true;
+      else if (x < y) less = true;
+    }
+    return more && less ? 2 : more ? 1 : less ? -1 : 0;
+  }
+
+  function maxVV(a, b) {
+    const out = cleanVV(a);
+    const other = cleanVV(b);
+    for (const k of Object.keys(other)) out[k] = Math.max(out[k] || 0, other[k]);
+    return cleanVV(out);
+  }
+
+  // Docs from before sync have no vectors. Seeding them from their text keeps
+  // identical copies equal, while copies that drifted apart count as separate changes.
+  function seedVV(d) {
+    if (d.vv) return false;
+    const k = 'v0-' + hash32(String(d.text)).toString(36);
+    d.vv = { [k]: 1 };
+    d.tv = { [k]: 1 };
+    return true;
+  }
+
+  // Counts one more change made on `device`.
+  function bumpVV(vv, device) {
+    const out = cleanVV(vv);
+    out[device] = (out[device] || 0) + 1;
+    return cleanVV(out);
+  }
+
+  // Fixed fields in a fixed order, so every device writes the same doc identically.
+  function syncDoc(d) {
+    return {
+      id: d.id,
+      title: typeof d.title === 'string' && d.title.trim() ? d.title : deriveTitle(d.text),
+      titleLocked: !!d.titleLocked,
+      text: d.text,
+      createdAt: Number(d.createdAt) || 0,
+      updatedAt: Number(d.updatedAt) || 0,
+      changedAt: docStamp(d),
+      pinned: !!d.pinned,
+      pinAt: Number(d.pinAt) || 0,
+      titleAt: Number(d.titleAt) || 0,
+      vv: cleanVV(d.vv),
+      tv: cleanVV(d.tv),
+    };
+  }
+
+  function syncPos(p) {
+    return {
+      id: p.id,
+      offset: Math.max(0, Number(p.offset) || 0),
+      progress: clamp(Number(p.progress) || 0, 0, 1),
+      done: !!p.done,
+      at: Number(p.at) || 0,
+    };
+  }
+
+  function syncTomb(t) {
+    if (typeof t === 'number') return t > 0 ? { at: t, vv: {} } : null;
+    if (!t || typeof t !== 'object' || !(Number(t.at) > 0)) return null;
+    return { at: Number(t.at), vv: cleanVV(t.vv) };
+  }
+
+  // Newer stamp wins; on a tie the larger serialization wins, so every device picks the same one.
+  function wins(a, b, stamp) {
+    const sa = stamp(a);
+    const sb = stamp(b);
+    return sa !== sb ? sa > sb : JSON.stringify(a) > JSON.stringify(b);
+  }
+
+  function byId(a, b) {
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  }
+
+  // The losing side of a clash, kept as its own text. Its id comes from its
+  // content, so devices that spot the same clash make the same copy.
+  function clashCopy(d, suffix) {
+    const id = d.id + '-' + hash32(d.text + '\u0000' + JSON.stringify(d.tv)).toString(36);
+    const title = d.title.endsWith(suffix) ? d.title : d.title + suffix;
+    return Object.assign({}, d, { id, title, titleLocked: true });
+  }
+
+  /*
+   * Merges this device's library with the synced copy. Nothing is lost silently:
+   * - a version that includes the other one wins;
+   * - if both sides changed the same doc, its title and pin each keep their
+   *   latest change, and if both changed its text, the newer text wins and the
+   *   other is kept as a copy;
+   * - a deletion removes only the versions the deleting device had seen.
+   * local/remote: { docs, positions, tombs: { id: { at, vv } } }
+   * Returns { docs, positions, tombs, copies } with docs/positions sorted by id.
+   */
+  function mergeSync(local, remote, opts) {
+    const o = opts || {};
+    const pruneBefore = Number(o.pruneBefore) || 0;
+    const suffix = o.copySuffix || ' (other copy)';
+    const maxText = Number(o.maxText) || Infinity;
+
+    const tombs = new Map();
+    for (const src of [local && local.tombs, remote && remote.tombs]) {
+      if (!src || typeof src !== 'object') continue;
+      for (const id of Object.keys(src)) {
+        const t = syncTomb(src[id]);
+        if (!t || t.at <= pruneBefore) continue;
+        const cur = tombs.get(id);
+        tombs.set(id, cur ? { at: Math.max(cur.at, t.at), vv: maxVV(cur.vv, t.vv) } : t);
+      }
+    }
+
+    const collect = (list) => {
+      const m = new Map();
+      for (const raw of list || []) {
+        if (!isValidDoc(raw) || !raw.text.trim() || raw.text.length > maxText) continue;
+        const d = syncDoc(raw);
+        const cur = m.get(d.id);
+        if (!cur || wins(d, cur, docStamp)) m.set(d.id, d);
+      }
+      return m;
+    };
+    const mine = collect(local && local.docs);
+    const theirs = collect(remote && remote.docs);
+
+    const docs = new Map();
+    const copies = [];
+    for (const id of new Set([...mine.keys(), ...theirs.keys()])) {
+      const a = mine.get(id);
+      const b = theirs.get(id);
+      let d = a || b;
+      if (a && b) {
+        const c = compareVV(a.vv, b.vv);
+        if (c === 1) d = a;
+        else if (c === -1) d = b;
+        else {
+          const meta = wins(a, b, docStamp) ? a : b;
+          const tc = compareVV(a.tv, b.tv);
+          const body = tc === 1 ? a : tc === -1 ? b : meta;
+          if (tc !== 1 && tc !== -1 && a.text !== b.text) {
+            const copy = clashCopy(body === a ? b : a, suffix);
+            if (!mine.has(copy.id) && !theirs.has(copy.id)) {
+              docs.set(copy.id, copy);
+              copies.push(copy.id);
+            }
+          }
+          const pin = a.pinAt !== b.pinAt ? (a.pinAt > b.pinAt ? a : b) : meta;
+          const named = a.titleAt !== b.titleAt ? (a.titleAt > b.titleAt ? a : b) : meta;
+          d = Object.assign({}, meta, {
+            title: named.titleLocked ? named.title : deriveTitle(body.text),
+            titleLocked: named.titleLocked,
+            titleAt: named.titleAt,
+            text: body.text,
+            updatedAt: body.updatedAt,
+            changedAt: Math.max(a.changedAt, b.changedAt),
+            pinned: pin.pinned,
+            pinAt: pin.pinAt,
+            vv: maxVV(a.vv, b.vv),
+            tv: maxVV(a.tv, b.tv),
+          });
+        }
+      }
+      const t = tombs.get(id);
+      if (t) {
+        if (compareVV(d.vv, t.vv) <= 0) continue; // the deleting device had seen this version
+        tombs.delete(id); // changed somewhere the deletion didn't know about, so it stays
+      }
+      docs.set(id, d);
+    }
+
+    const positions = new Map();
+    for (const list of [local && local.positions, remote && remote.positions]) {
+      for (const raw of list || []) {
+        if (!raw || typeof raw.id !== 'string' || !docs.has(raw.id)) continue;
+        const p = syncPos(raw);
+        const cur = positions.get(p.id);
+        if (!cur || wins(p, cur, (x) => x.at)) positions.set(p.id, p);
+      }
+    }
+
+    return {
+      docs: [...docs.values()].sort(byId),
+      positions: [...positions.values()].sort(byId),
+      tombs: Object.fromEntries([...tombs.keys()].sort().map((id) => [id, tombs.get(id)])),
+      copies,
+    };
+  }
+
+  // Splits a merged library into gist files: { filename: content }.
+  function buildSyncFiles(m) {
+    const files = {};
+    files[SYNC_INDEX] = JSON.stringify({ app: 'readout', schema: SYNC_SCHEMA, positions: m.positions || [], tombs: m.tombs || {} });
+    const shards = new Map();
+    for (const d of m.docs || []) {
+      const name = shardName(d.id);
+      if (!shards.has(name)) shards.set(name, []);
+      shards.get(name).push(d);
+    }
+    for (const name of [...shards.keys()].sort()) {
+      files[name] = JSON.stringify({ app: 'readout', schema: SYNC_SCHEMA, docs: shards.get(name) });
+    }
+    return files;
+  }
+
+  // Reads gist files back into { docs, positions, tombs }. `newer` means another
+  // device wrote a format this version doesn't know, and `bad` lists unreadable files.
+  function parseSyncFiles(files) {
+    const out = { docs: [], positions: [], tombs: {}, newer: false, bad: [] };
+    for (const name of Object.keys(files || {}).sort()) {
+      if (!isSyncFile(name)) continue;
+      let data = null;
+      try {
+        data = JSON.parse(files[name]);
+      } catch (e) {
+        /* unreadable */
+      }
+      if (!data || typeof data !== 'object' || data.app !== 'readout') {
+        out.bad.push(name);
+        continue;
+      }
+      if (Number(data.schema) > SYNC_SCHEMA) out.newer = true;
+      if (name === SYNC_INDEX) {
+        if (Array.isArray(data.positions)) out.positions = data.positions;
+        if (data.tombs && typeof data.tombs === 'object') out.tombs = data.tombs;
+      } else if (Array.isArray(data.docs)) {
+        for (const d of data.docs) out.docs.push(d);
+      }
+    }
+    return out;
+  }
+
+  // The gist update that turns `remote` into `next`: changed files, and null for files to delete.
+  function diffSyncFiles(next, remote) {
+    const patch = {};
+    let n = 0;
+    for (const name of Object.keys(next)) {
+      if (!remote || remote[name] !== next[name]) {
+        patch[name] = { content: next[name] };
+        n++;
+      }
+    }
+    for (const name of Object.keys(remote || {})) {
+      if (isSyncFile(name) && !(name in next)) {
+        patch[name] = null;
+        n++;
+      }
+    }
+    return n ? patch : null;
+  }
+
+  // A sync key carries everything another device needs: the gist and the token.
+  const SYNC_KEY_PREFIX = 'readout-sync:';
+  function makeSyncKey(gistId, token) {
+    return SYNC_KEY_PREFIX + gistId + ':' + token;
+  }
+  function parseSyncKey(str) {
+    const s = String(str || '').trim();
+    if (s.startsWith(SYNC_KEY_PREFIX)) {
+      const m = s.slice(SYNC_KEY_PREFIX.length).match(/^([0-9a-f]{20,40}):(\S{20,})$/i);
+      return m ? { gistId: m[1].toLowerCase(), token: m[2] } : null;
+    }
+    if (/^(github_pat_|ghp_|gho_)[A-Za-z0-9_]{20,}$/.test(s)) return { gistId: null, token: s };
+    return null;
   }
 
   function uid() {
@@ -393,7 +715,22 @@
     formatInsert,
     normalizeLang,
     pickVoice,
+    docStamp,
     mergeDocs,
+    SYNC_INDEX,
+    isSyncFile,
+    shardName,
+    compareVV,
+    maxVV,
+    bumpVV,
+    seedVV,
+    syncDoc,
+    mergeSync,
+    buildSyncFiles,
+    parseSyncFiles,
+    diffSyncFiles,
+    makeSyncKey,
+    parseSyncKey,
     uid,
     clamp,
   };

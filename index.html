@@ -13,9 +13,9 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600&family=Literata:wght@400;500;600&display=swap">
-  <link rel="stylesheet" href="styles.css?v=1">
-  <script src="core.js?v=1" defer></script>
-  <script src="app.js?v=1" defer></script>
+  <link rel="stylesheet" href="styles.css?v=2">
+  <script src="core.js?v=2" defer></script>
+  <script src="app.js?v=2" defer></script>
 </head>
 <body>
   <svg xmlns="http://www.w3.org/2000/svg" width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
@@ -41,6 +41,7 @@
     <symbol id="i-wrap" viewBox="0 0 24 24"><path d="M4 6h16M4 12h13a3 3 0 0 1 0 6h-4M15 16l-2 2 2 2M4 18h5"/></symbol>
     <symbol id="i-restart" viewBox="0 0 24 24"><path d="M4.5 12a7.5 7.5 0 1 0 2.2-5.3M4.5 4v4.5H9"/></symbol>
     <symbol id="i-locate" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.5"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3"/></symbol>
+    <symbol id="i-sync" viewBox="0 0 24 24"><path d="M19.5 12a7.5 7.5 0 0 1-13 5.1M4.5 12a7.5 7.5 0 0 1 13-5.1M17.5 3.5v3.6h-3.6M6.5 20.5v-3.6h3.6"/></symbol>
     <symbol id="i-voice" viewBox="0 0 24 24"><path d="M4 9.5v5h3.5L12 19V5L7.5 9.5H4zM15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/></symbol>
   </svg>
 
@@ -204,6 +205,39 @@
       </div>
       <label class="toggle"><span><span class="toggle-title">Spoken punctuation</span><span class="toggle-desc">Say “comma”, “period”, “question mark”, or “new paragraph”.</span></span><input type="checkbox" id="punctToggle"><span class="switch" aria-hidden="true"></span></label>
       <label class="toggle" id="localToggleRow" hidden><span><span class="toggle-title">Prefer on-device recognition</span><span class="toggle-desc">Keeps your voice on this device and works offline, once Chrome downloads the language pack.</span></span><input type="checkbox" id="localToggle"><span class="switch" aria-hidden="true"></span></label>
+    </section>
+
+    <section class="settings-group">
+      <h3 class="group-title">Sync</h3>
+      <div id="syncSetup">
+        <p class="group-desc">Keep the same texts and notes on your phone and computer. Readout keeps them in a secret gist on your GitHub account.</p>
+        <ol class="steps">
+          <li><a id="syncTokenLink" href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">Create a GitHub token</a>. The form opens filled in: scroll down, tap <b>Generate token</b>, and copy the token.</li>
+          <li>Paste it here and tap <b>Connect</b>. On your other devices, paste the <b>sync key</b> from this device instead.</li>
+        </ol>
+        <div class="field-row">
+          <input class="input" id="syncInput" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Token or sync key" aria-label="GitHub token or sync key">
+          <button class="btn btn-primary" id="syncConnectBtn" type="button">Connect</button>
+        </div>
+        <p class="field-hint" id="syncSetupMsg" role="status"></p>
+        <div class="sync-confirm" id="syncConfirm" hidden>
+          <p class="group-desc">No Readout sync was found on this GitHub account. If sync is already on for another device, paste the sync key from that device instead.</p>
+          <div class="field-row">
+            <button class="btn btn-primary" id="syncCreateBtn" type="button">Start syncing from this device</button>
+            <button class="btn btn-quiet" id="syncCancelBtn" type="button">Cancel</button>
+          </div>
+        </div>
+      </div>
+      <div id="syncActive" hidden>
+        <p class="group-desc" id="syncStatus" role="status"></p>
+        <div class="field-row">
+          <button class="btn" id="syncNowBtn" type="button"><svg class="ic"><use href="#i-sync"/></svg>Sync now</button>
+          <button class="btn" id="syncKeyBtn" type="button"><svg class="ic"><use href="#i-copy"/></svg>Copy sync key</button>
+          <button class="btn btn-primary" id="syncFixBtn" type="button" hidden>Use a new token</button>
+        </div>
+        <p class="field-hint">To add another device, paste the sync key into Readout there. Keep it private: anyone with it can read and change your synced texts.</p>
+        <button class="btn btn-quiet sync-off" id="syncOffBtn" type="button">Turn off sync on this device</button>
+      </div>
     </section>
 
     <section class="settings-group">

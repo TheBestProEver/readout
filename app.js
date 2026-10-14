@@ -3,10 +3,13 @@
   'use strict';
 
   const Core = window.ReadoutCore;
-  const VERSION = '1.0.0';
+  const VERSION = '1.1.0';
   const CONFIG = Object.assign(
     {
       pdfjsBase: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@5.6.205/build/',
+      githubApi: 'https://api.github.com',
+      netWait: 45000, // ms to wait for a reply to start
+      netStall: 30000, // ms a reply may pause before giving up
       fastEndCheck: true,
     },
     window.READOUT_CONFIG || {}
@@ -251,10 +254,23 @@
     const ch = state.chunks[i];
     const offset = finished ? doc.text.length : ch ? ch.start + (tts.playing ? 0 : tts.wordOffset || 0) : 0;
     const progress = n ? (finished ? 1 : state.cum[i] / state.cum[n]) : 0;
+    const old = state.positions.get(doc.id);
+    if (old && old.offset === offset && !!old.done === finished) {
+      // Same place as before: keep its time, so it can't override newer progress from another device.
+      if (old.progress !== progress) {
+        const q = Object.assign({}, old, { progress });
+        state.positions.set(doc.id, q);
+        mirrorPosition(q);
+        store.putPos(q).catch(onStoreError);
+      }
+      renderLibrarySoon();
+      return;
+    }
     const p = { id: doc.id, offset, progress, done: finished, at: Date.now() };
     state.positions.set(doc.id, p);
     mirrorPosition(p);
     store.putPos(p).catch(onStoreError);
+    sync.dirty = true;
     renderLibrarySoon();
   }
 
@@ -285,6 +301,14 @@
     return state.docs.slice().sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || lastActive(b) - lastActive(a));
   }
 
+  // Records a change for sync: when it happened, and one more change from this device.
+  function touch(doc, textChanged) {
+    doc.changedAt = Date.now();
+    doc.vv = Core.bumpVV(doc.vv, sync.device);
+    if (textChanged) doc.tv = Core.bumpVV(doc.tv, sync.device);
+    syncSoon();
+  }
+
   function createDoc(text, title) {
     const now = Date.now();
     const t = typeof title === 'string' ? title.trim().slice(0, 120) : '';
@@ -295,8 +319,13 @@
       text: text || '',
       createdAt: now,
       updatedAt: now,
+      changedAt: now,
+      titleAt: t ? now : 0,
       pinned: false,
+      vv: {},
+      tv: {},
     };
+    if (doc.text) touch(doc, true);
     state.docs.push(doc);
     store.putDoc(doc).catch(onStoreError);
     requestPersist();
@@ -304,7 +333,18 @@
     return doc;
   }
 
-  function dropDocQuietly(doc) {
+  // The built-in welcome text has the same id and an "untouched" stamp on every
+  // device, so sync treats the copies as one, and deleting it anywhere deletes it everywhere.
+  function createWelcomeDoc() {
+    const now = Date.now();
+    const doc = { id: 'welcome', title: 'Welcome to Readout', titleLocked: true, text: WELCOME_TEXT, createdAt: now, updatedAt: now, changedAt: 1, pinned: false, vv: {}, tv: {} };
+    state.docs.push(doc);
+    store.putDoc(doc).catch(onStoreError);
+    return doc;
+  }
+
+  // Removes a doc from this device only. Sync uses this for deletions made elsewhere.
+  function removeDocLocally(doc) {
     const i = state.docs.indexOf(doc);
     if (i >= 0) state.docs.splice(i, 1);
     pendingDocs.delete(doc.id);
@@ -312,6 +352,15 @@
     forgetMirroredPosition(doc.id);
     store.deleteDoc(doc.id).catch(() => {});
     store.deletePos(doc.id).catch(() => {});
+  }
+
+  function dropDocQuietly(doc) {
+    removeDocLocally(doc);
+    if (doc.text.trim() || Object.keys(doc.vv || {}).length) {
+      sync.tombs[doc.id] = { at: Date.now(), vv: Object.assign({}, doc.vv) };
+      saveTombs();
+      syncSoon();
+    }
   }
 
   function openDoc(id, opts) {
@@ -327,6 +376,21 @@
     state.settings.lastDocId = doc.id;
     saveSettings();
     rebuildChunks();
+    placeAtSaved(doc);
+    state.mode = o.mode || (doc.text.trim() ? 'listen' : 'edit');
+    if (state.mode === 'edit') el.editor.value = doc.text;
+    renderView();
+    if (state.mode === 'listen') {
+      renderReader();
+      el.stage.scrollTop = 0;
+      if (spans[curSpan]) scrollToSpan(spans[curSpan], true, 'auto');
+    }
+    renderLibrary();
+    updateMediaSession();
+  }
+
+  // Moves the reading place to where this doc was left off.
+  function placeAtSaved(doc) {
     const pos = state.positions.get(doc.id);
     tts.wordOffset = 0;
     if (pos && pos.done) {
@@ -338,16 +402,6 @@
     } else {
       state.idx = 0;
     }
-    state.mode = o.mode || (doc.text.trim() ? 'listen' : 'edit');
-    if (state.mode === 'edit') el.editor.value = doc.text;
-    renderView();
-    if (state.mode === 'listen') {
-      renderReader();
-      el.stage.scrollTop = 0;
-      if (spans[curSpan]) scrollToSpan(spans[curSpan], true, 'auto');
-    }
-    renderLibrary();
-    updateMediaSession();
   }
 
   function showWelcome() {
@@ -395,6 +449,13 @@
     toast(`Deleted “${doc.title}”.`, {
       action: 'Undo',
       onAction: () => {
+        // A sync may have brought back another version meanwhile. It's still in the
+        // gist, so drop it here and let the next sync merge it with this one.
+        const back = state.docs.find((d) => d !== doc && d.id === id);
+        if (back) removeDocLocally(back);
+        delete sync.tombs[id];
+        saveTombs();
+        touch(doc, false);
         state.docs.push(doc);
         store.putDoc(doc).catch(onStoreError);
         if (pos) {
@@ -414,6 +475,7 @@
     doc.text = text;
     doc.updatedAt = Date.now();
     if (!doc.titleLocked) doc.title = Core.deriveTitle(text);
+    touch(doc, true);
     scheduleSave(doc);
     if (state.current === doc) {
       rebuildChunks();
@@ -575,6 +637,7 @@
       return;
     }
     const wasEditing = state.mode === 'edit';
+    if (wasEditing && sync.dirty) syncSoon(800);
     state.mode = 'listen';
     if (state.dirty || !state.chunks.length) {
       const n = state.chunks.length;
@@ -1256,6 +1319,7 @@
     updateMediaSession();
     saveSettings();
     renderPlayer();
+    syncSoon(1500);
   }
 
   /* ================= dictation ================= */
@@ -1431,6 +1495,7 @@
 
   function finishDictationUI() {
     if (dict.on) return;
+    if (sync.dirty) syncSoon(1500); // anything held back while dictating
     el.dictation.hidden = true;
     el.dictInterim.textContent = '';
     el.dictateBtn.setAttribute('aria-pressed', 'false');
@@ -1459,15 +1524,19 @@
 
   /* ================= editing, pasting, files ================= */
 
+  const editing = { lastAt: 0, composing: false };
+
   function onEditorInput() {
     const doc = state.current;
     if (!doc) return;
+    editing.lastAt = Date.now();
     doc.text = el.editor.value;
     doc.updatedAt = Date.now();
     if (!doc.titleLocked) {
       doc.title = Core.deriveTitle(doc.text);
       renderTitle();
     }
+    touch(doc, true);
     state.dirty = true;
     scheduleSave(doc);
     renderLibrarySoon();
@@ -1614,7 +1683,8 @@
           cur.text = text;
           cur.title = title;
           cur.titleLocked = true;
-          cur.updatedAt = Date.now();
+          cur.updatedAt = cur.titleAt = Date.now();
+          touch(cur, true);
           scheduleSave(cur);
           last = cur;
         } else {
@@ -1732,6 +1802,8 @@
       savePositionNow();
     } else if (act === 'pin') {
       doc.pinned = !doc.pinned;
+      doc.pinAt = Date.now();
+      touch(doc, false);
       scheduleSave(doc);
       renderLibrary();
       toast(doc.pinned ? 'Pinned to the top.' : 'Unpinned.');
@@ -1772,9 +1844,28 @@
       return;
     }
     const before = new Set(state.docs);
+    const prev = new Map(state.docs.map((d) => [d.id, d]));
     const r = Core.mergeDocs(state.docs, data.docs);
     state.docs = r.docs;
-    for (const d of state.docs) if (!before.has(d)) store.putDoc(d).catch(onStoreError);
+    for (const d of state.docs) {
+      if (before.has(d)) continue;
+      Core.seedVV(d);
+      // Restoring a deleted text, or replacing this device's copy, counts as a new
+      // change made here, so sync spreads it instead of undoing it.
+      const tomb = sync.tombs[d.id];
+      const old = prev.get(d.id);
+      if (tomb || old) {
+        d.vv = Core.maxVV(Core.maxVV(d.vv, tomb && tomb.vv), old && old.vv);
+        d.tv = Core.maxVV(d.tv, old && old.tv);
+        if (tomb) {
+          delete sync.tombs[d.id];
+          saveTombs();
+        }
+        touch(d, true);
+      }
+      store.putDoc(d).catch(onStoreError);
+    }
+    syncSoon();
     for (const p of data.positions || []) {
       if (!p || typeof p.id !== 'string' || !state.docs.some((d) => d.id === p.id)) continue;
       const cur = state.positions.get(p.id);
@@ -1792,6 +1883,574 @@
     if (r.added) parts.push(`${r.added} new ${r.added === 1 ? 'text' : 'texts'}`);
     if (r.updated) parts.push(`${r.updated} updated`);
     toast(parts.length ? `Imported ${parts.join(' and ')}.` : 'Everything in that backup is already here.');
+  }
+
+  /* ================= sync ================= */
+
+  // Texts sync through a secret gist on the user's GitHub account. Each sync reads
+  // the gist, merges it with this device (Core.mergeSync), keeps the result here,
+  // and writes back only the files that changed.
+  const SYNC_MAX_TEXT = 3000000;
+  const TOMB_DAYS = 180;
+  const GIST_DESC = 'Readout sync. Readout keeps your texts here and updates this gist itself, so please don’t edit it.';
+  const TOKEN_URL =
+    'https://github.com/settings/personal-access-tokens/new?name=Readout+sync&description=Lets+Readout+sync+your+texts+through+a+secret+gist.&expires_in=none&gists=write';
+  const STOPPED = new Set(['auth', 'denied', 'missing', 'newer']); // need the user before trying again
+
+  const sync = {
+    device: '',
+    cfg: null, // { token, gistId, login }
+    tombs: {}, // deleted docs: { id: { at, vv } }
+    remote: null, // { etag, files } as last read from the gist
+    raw: new Map(), // full copies of files over 1 MB, by their versioned URL
+    running: null,
+    again: false,
+    timer: null,
+    due: 0,
+    dirty: false,
+    lastOk: 0,
+    lastTry: 0,
+    error: '',
+    retryAt: 0,
+    backoff: 0,
+    skipped: 0,
+    pending: null, // a token waiting for "start syncing from this device"
+    shown: new Set(),
+  };
+
+  function saveTombs() {
+    store.set('tombs', sync.tombs).catch(onStoreError);
+  }
+
+  function syncError(kind, extra) {
+    const e = new Error('sync ' + kind);
+    e.kind = kind;
+    return Object.assign(e, extra);
+  }
+
+  // One GitHub API call. Resolves to { status, headers, data } with the JSON body already read.
+  async function gh(token, method, path, body, etag) {
+    const headers = {
+      Accept: 'application/vnd.github+json',
+      Authorization: 'Bearer ' + token,
+      'X-GitHub-Api-Version': '2026-03-10',
+    };
+    const payload = body ? JSON.stringify(body) : undefined;
+    if (payload) headers['Content-Type'] = 'application/json';
+    if (etag) headers['If-None-Match'] = etag;
+    // no-store with our own If-None-Match: never a stale cached copy, and unchanged checks are free.
+    const res = await fetchPatiently(CONFIG.githubApi + path, { method, headers, body: payload, cache: 'no-store' }, payload ? payload.length : 0);
+    let data = null;
+    if (res.status !== 304) {
+      const text = await res.read();
+      try {
+        data = text ? JSON.parse(text) : null;
+      } catch (e) {
+        if (res.ok) throw syncError('server');
+      }
+    }
+    const out = { status: res.status, headers: res.headers, data };
+    if (res.ok || res.status === 304) return out;
+    const h = (k) => res.headers.get(k);
+    const message = String((data && data.message) || '');
+    if (res.status === 401) throw syncError('auth');
+    if (res.status === 429 || ((res.status === 403 || res.status === 422) && (h('retry-after') || h('x-ratelimit-remaining') === '0' || /rate limit|spammed|abuse/i.test(message)))) {
+      const wait = Number(h('retry-after')) * 1000 || (Number(h('x-ratelimit-reset')) * 1000 || 0) - Date.now();
+      throw syncError('busy', { retryAt: Date.now() + Math.max(60000, wait || 0) });
+    }
+    if (res.status === 403) throw syncError('denied');
+    if (res.status === 404) throw syncError(method === 'GET' ? 'missing' : 'denied'); // GitHub hides missing permissions as 404
+    throw syncError('server');
+  }
+
+  // fetch() that gives up on a dead connection without cutting off slow ones: it
+  // waits longer for big uploads, and once the reply starts, only a stall ends it.
+  // Returns the Response with a read() that resolves to its text.
+  async function fetchPatiently(url, init, uploadSize) {
+    const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = ctrl && setTimeout(() => ctrl.abort(), CONFIG.netWait + (uploadSize || 0) / 5);
+    let res;
+    try {
+      res = await fetch(url, Object.assign({}, init, ctrl ? { signal: ctrl.signal } : null));
+    } catch (e) {
+      throw syncError('offline');
+    } finally {
+      clearTimeout(timer);
+    }
+    res.read = async () => {
+      if (!ctrl || !res.body || !res.body.getReader) return res.text().catch(() => Promise.reject(syncError('offline')));
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let text = '';
+      let stall = null;
+      const wait = () => {
+        clearTimeout(stall);
+        stall = setTimeout(() => ctrl.abort(), CONFIG.netStall);
+      };
+      try {
+        wait();
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          wait();
+          text += dec.decode(value, { stream: true });
+        }
+        return text + dec.decode();
+      } catch (e) {
+        throw syncError('offline');
+      } finally {
+        clearTimeout(stall);
+      }
+    };
+    return res;
+  }
+
+  // Our files from a gist (an API response body). Files over 1 MB come back cut
+  // short, so those are fetched in full. Their URLs name the exact version, so
+  // unchanged ones are reused, and each one is kept as soon as it arrives.
+  async function readGist(g) {
+    const files = {};
+    const urls = new Set();
+    for (const f of Object.values((g && g.files) || {})) {
+      if (!f || !Core.isSyncFile(f.filename)) continue;
+      let text = typeof f.content === 'string' && !f.truncated ? f.content : null;
+      if (text == null && f.raw_url) {
+        urls.add(f.raw_url);
+        text = sync.raw.get(f.raw_url);
+        if (text == null) {
+          const r = await fetchPatiently(f.raw_url, {}); // a plain request: raw_url refuses custom headers
+          if (!r.ok) throw syncError('server');
+          text = await r.read();
+          sync.raw.set(f.raw_url, text);
+        }
+      }
+      if (text == null) throw syncError('server');
+      files[f.filename] = text;
+    }
+    for (const u of [...sync.raw.keys()]) if (!urls.has(u)) sync.raw.delete(u);
+    return { id: g && g.id, owner: (g && g.owner && g.owner.login) || '', files };
+  }
+
+  // How much the current doc must stay put: 'busy' while the user types, dictates,
+  // or listens (nothing from elsewhere is applied to it), 'open' in an idle editor
+  // (plain updates show up, but a clash waits so the text being edited isn't swapped).
+  function holdKind() {
+    if (!state.current) return null;
+    if (tts.playing || dict.on) return 'busy';
+    if (state.mode !== 'edit' || document.activeElement !== el.editor) return null;
+    return document.hasFocus() && (editing.composing || Date.now() - editing.lastAt < 10000) ? 'busy' : 'open';
+  }
+
+  async function runSync() {
+    const cfg = sync.cfg;
+    flushDocs();
+    let remote = sync.remote;
+    const res = await gh(cfg.token, 'GET', '/gists/' + cfg.gistId, null, remote && remote.etag);
+    if (res.status !== 304 || !remote) remote = { etag: res.headers.get('ETag'), files: (await readGist(res.data)).files };
+    if (sync.cfg !== cfg) return;
+    const theirs = Core.parseSyncFiles(remote.files);
+    if (theirs.newer) throw syncError('newer');
+    if (theirs.bad.length) console.warn('Readout sync: unreadable files replaced', theirs.bad);
+
+    const hold = holdKind();
+    const cur = state.current;
+    const docs = [];
+    let skipped = 0;
+    let held = false;
+    for (const d of state.docs) {
+      if (!d.text.trim()) continue;
+      if (d.text.length > SYNC_MAX_TEXT) {
+        skipped++;
+        continue;
+      }
+      if (hold && d === cur) {
+        // Something new for this doc arrived from elsewhere: hold both sides until the user is done.
+        const r = theirs.docs.find((x) => x && x.id === d.id);
+        const c = r && Core.compareVV(Core.syncDoc(d).vv, Core.syncDoc(r).vv);
+        if (r && (c === 2 || (c === -1 && hold === 'busy'))) {
+          docs.push(r);
+          held = true;
+          sync.dirty = true;
+          continue;
+        }
+      }
+      docs.push(d);
+    }
+    sync.skipped = skipped;
+    const now = Date.now();
+    const m = Core.mergeSync({ docs, positions: [...state.positions.values()], tombs: sync.tombs }, theirs, {
+      pruneBefore: now - TOMB_DAYS * 86400000,
+      maxText: SYNC_MAX_TEXT,
+    });
+    applySynced(m, held || hold === 'busy' ? cur : null);
+
+    const patch = Core.diffSyncFiles(Core.buildSyncFiles(m), remote.files);
+    if (patch) {
+      const res2 = await gh(cfg.token, 'PATCH', '/gists/' + cfg.gistId, { files: patch });
+      remote = { etag: res2.headers.get('ETag'), files: (await readGist(res2.data)).files };
+    }
+    if (sync.cfg !== cfg) return;
+    sync.remote = remote;
+    sync.lastOk = Date.now();
+    sync.error = '';
+    sync.backoff = 0;
+    store.set('sync', Object.assign({}, cfg, { lastOk: sync.lastOk })).catch(() => {});
+    return held && hold === 'busy' && !tts.playing && !dict.on; // typing that will pause on its own
+  }
+
+  // Brings this device in line with a merge result.
+  function applySynced(m, busy) {
+    const cur = state.current;
+    const local = new Map(state.docs.map((d) => [d.id, d]));
+    const merged = new Map(m.docs.map((d) => [d.id, d]));
+    let changed = false;
+    let curText = false;
+    let curGone = null;
+    for (const d of m.docs) {
+      const mine = local.get(d.id);
+      // Busy, emptied, or too-long docs stay as they are here; the merge left them out.
+      if (mine && (mine === busy || !mine.text.trim() || mine.text.length > SYNC_MAX_TEXT)) continue;
+      if (!mine) {
+        const nd = Object.assign({}, d);
+        state.docs.push(nd);
+        store.putDoc(nd).catch(onStoreError);
+        changed = true;
+      } else if (JSON.stringify(Core.syncDoc(mine)) !== JSON.stringify(d)) {
+        if (mine === cur && mine.text !== d.text) curText = true;
+        Object.assign(mine, d);
+        pendingDocs.delete(mine.id);
+        store.putDoc(mine).catch(onStoreError);
+        changed = true;
+      }
+    }
+    for (const mine of state.docs.slice()) {
+      if (merged.has(mine.id) || mine === busy || !mine.text.trim() || mine.text.length > SYNC_MAX_TEXT) continue;
+      if (mine === cur) curGone = mine;
+      removeDocLocally(mine);
+      changed = true;
+    }
+    let curMoved = false;
+    for (const p of m.positions) {
+      const mine = state.positions.get(p.id);
+      if (mine && (mine.at || 0) >= p.at) continue;
+      if (busy && busy.id === p.id) continue;
+      state.positions.set(p.id, p);
+      mirrorPosition(p);
+      store.putPos(p).catch(onStoreError);
+      if (cur && cur.id === p.id) curMoved = true;
+      changed = true;
+    }
+    sync.tombs = m.tombs;
+    saveTombs();
+
+    if (curGone) {
+      state.current = null;
+      openNextOrWelcome();
+      toast(`“${curGone.title}” was deleted on another device.`);
+    } else if (cur && (curText || curMoved) && state.current === cur) {
+      if (curText) rebuildChunks();
+      if (!tts.playing) placeAtSaved(cur);
+      if (state.mode === 'edit') {
+        if (curText) {
+          const ta = el.editor;
+          const s = ta.selectionStart;
+          const e = ta.selectionEnd;
+          ta.value = cur.text;
+          if (document.activeElement === ta) ta.setSelectionRange(Math.min(s, ta.value.length), Math.min(e, ta.value.length));
+        }
+      } else if (!tts.playing) {
+        renderReader();
+        if (spans[curSpan]) scrollToSpan(spans[curSpan], true, 'auto');
+      }
+      renderView();
+    }
+    if (changed) {
+      renderTitle();
+      renderLibrary();
+    }
+    if (m.copies.length) {
+      toast(m.copies.length === 1 ? 'A text was changed on two devices at once, so Readout kept both versions.' : `${m.copies.length} texts were changed on two devices at once, so Readout kept both versions of each.`);
+    }
+  }
+
+  function syncNow(manual) {
+    if (!sync.cfg) return Promise.resolve();
+    clearTimeout(sync.timer);
+    sync.timer = null;
+    sync.due = 0;
+    if (sync.running) {
+      sync.again = true;
+      return sync.running;
+    }
+    if (!manual && (STOPPED.has(sync.error) || Date.now() < sync.retryAt)) {
+      if (!STOPPED.has(sync.error)) sync.timer = setTimeout(syncNow, sync.retryAt - Date.now());
+      return Promise.resolve();
+    }
+    renderSyncStatus(true);
+    sync.running = (async () => {
+      let held = false;
+      try {
+        do {
+          sync.again = false;
+          sync.dirty = false;
+          sync.lastTry = Date.now();
+          held = await runSync();
+        } while (sync.again && sync.cfg);
+        // Typing that waited for a change from elsewhere is looked at again once the typing pauses.
+        if (held) syncSoon(Math.max(500, editing.lastAt + 10500 - Date.now()));
+      } catch (e) {
+        sync.dirty = true;
+        onSyncError(e);
+      } finally {
+        sync.running = null;
+        renderSyncStatus();
+      }
+    })();
+    return sync.running;
+  }
+
+  // Waits for a pause in changes before syncing, but never more than 20 s, or a
+  // minute while typing (Done and leaving the app sync right away). Each write
+  // downloads the whole gist back, so fewer writes save phone data.
+  function syncSoon(ms) {
+    sync.dirty = true;
+    if (!sync.cfg) return;
+    const now = Date.now();
+    const typing = state.mode === 'edit' && document.activeElement === el.editor;
+    if (!sync.due) sync.due = now + (typing ? 60000 : 20000);
+    clearTimeout(sync.timer);
+    sync.timer = setTimeout(syncNow, Math.max(0, Math.min(now + (ms != null ? ms : typing ? 8000 : 4000), sync.due) - now));
+  }
+
+  function onSyncError(e) {
+    const kind = (e && e.kind) || 'server';
+    if (!e || !e.kind) console.warn('Readout sync error', e);
+    sync.error = kind;
+    if (kind === 'busy') sync.retryAt = e.retryAt;
+    else if (kind === 'offline' || kind === 'server') {
+      sync.backoff = Math.min(600000, sync.backoff ? sync.backoff * 2 : 30000);
+      sync.retryAt = Date.now() + sync.backoff;
+      sync.timer = setTimeout(syncNow, sync.backoff);
+    }
+    if (kind === 'missing') sync.remote = null;
+    if (kind === 'denied') store.set('lastGistId', null).catch(() => {});
+    if (STOPPED.has(kind) && !sync.shown.has(kind)) {
+      sync.shown.add(kind);
+      toast(syncMessage() + ' See Settings.');
+    }
+  }
+
+  function syncMessage() {
+    switch (sync.error) {
+      case 'auth':
+        return 'Sync stopped: GitHub no longer accepts the token. It may have expired or been deleted.';
+      case 'denied':
+        return 'Sync stopped: the token isn’t allowed to change gists.';
+      case 'missing':
+        return 'Sync stopped: the sync gist was deleted on GitHub.';
+      case 'newer':
+        return 'Another device synced with a newer version of Readout. Reload this page to update.';
+      case 'busy':
+        return 'GitHub asked Readout to slow down. It will try again in a minute.';
+      case 'offline':
+        return 'Offline. Readout will sync when you’re back online.';
+      case 'server':
+        return 'Couldn’t reach GitHub just now. Readout will try again.';
+      default:
+        return '';
+    }
+  }
+
+  async function findSyncGist(token) {
+    let best = null;
+    for (let page = 1; page <= 5; page++) {
+      const res = await gh(token, 'GET', `/gists?per_page=100&page=${page}`);
+      const list = res.data;
+      if (!Array.isArray(list) || !list.length) break;
+      for (const g of list) {
+        if (g && g.files && g.files[Core.SYNC_INDEX] && (!best || g.updated_at > best.updated_at)) best = g;
+      }
+      if (list.length < 100) break;
+    }
+    return best ? best.id : null;
+  }
+
+  // Whether a gist is a Readout sync gist, and whose it is.
+  async function isSyncGist(token, id) {
+    const g = await readGist((await gh(token, 'GET', '/gists/' + id)).data);
+    return { ok: !!g.files[Core.SYNC_INDEX], owner: g.owner };
+  }
+
+  function setSyncMsg(text) {
+    el.syncSetupMsg.textContent = text || '';
+  }
+
+  async function connectSync() {
+    const key = Core.parseSyncKey(el.syncInput.value);
+    if (!key) {
+      setSyncMsg('That doesn’t look like a GitHub token or a Readout sync key. Tokens start with “github_pat_”.');
+      return;
+    }
+    el.syncConnectBtn.disabled = true;
+    setSyncMsg('Connecting…');
+    sync.pending = null;
+    renderSync();
+    try {
+      let login = '';
+      const me = await gh(key.token, 'GET', '/user').catch((e) => {
+        if (e.kind === 'auth' || e.kind === 'offline') throw e;
+        return null; // a token limited to gists may not be allowed to read the profile
+      });
+      if (me) login = (me.data || {}).login || '';
+      let gistId = key.gistId;
+      if (gistId) {
+        if (!(await isSyncGist(key.token, gistId)).ok) throw syncError('notours');
+      } else {
+        // A new token for a gist this device used before (say, after the old token
+        // expired) rejoins it, if the gist belongs to the same GitHub account.
+        const last = await store.get('lastGistId').catch(() => null);
+        const g = last ? await isSyncGist(key.token, last).catch(() => null) : null;
+        if (g && g.ok && (!login || g.owner.toLowerCase() === login.toLowerCase())) gistId = last;
+        else gistId = await findSyncGist(key.token);
+      }
+      if (!gistId) {
+        sync.pending = { token: key.token, login };
+        setSyncMsg('');
+        renderSync();
+        return;
+      }
+      await startSync({ token: key.token, gistId, login }, false);
+    } catch (e) {
+      setSyncMsg(connectError(e));
+    } finally {
+      el.syncConnectBtn.disabled = false;
+    }
+  }
+
+  function connectError(e) {
+    switch (e && e.kind) {
+      case 'auth':
+        return 'GitHub didn’t accept that token. Check that you copied all of it, or make a new one.';
+      case 'offline':
+        return 'Couldn’t reach GitHub. Check your connection and try again.';
+      case 'missing':
+      case 'notours':
+        return 'That sync key points to a gist that isn’t there anymore. Copy a fresh key from your other device.';
+      case 'denied':
+        return 'That token isn’t allowed to use gists. Make a new token with the link above.';
+      case 'busy':
+        return 'GitHub is busy. Try again in a minute.';
+      default:
+        console.warn('Readout sync connect error', e);
+        return 'Something went wrong talking to GitHub. Try again.';
+    }
+  }
+
+  async function createSyncGist() {
+    const p = sync.pending;
+    if (!p) return;
+    el.syncCreateBtn.disabled = true;
+    try {
+      const empty = Core.buildSyncFiles({});
+      const res = await gh(p.token, 'POST', '/gists', {
+        description: GIST_DESC,
+        public: false,
+        files: { [Core.SYNC_INDEX]: { content: empty[Core.SYNC_INDEX] } },
+      });
+      const g = res.data || {};
+      await startSync({ token: p.token, gistId: g.id, login: p.login }, true);
+    } catch (e) {
+      setSyncMsg(connectError(e));
+    } finally {
+      el.syncCreateBtn.disabled = false;
+    }
+  }
+
+  async function startSync(cfg, created) {
+    sync.cfg = cfg;
+    sync.remote = null;
+    sync.pending = null;
+    sync.error = '';
+    sync.retryAt = 0;
+    sync.shown.clear();
+    el.syncInput.value = '';
+    setSyncMsg('');
+    await store.set('sync', cfg);
+    store.set('lastGistId', cfg.gistId).catch(() => {});
+    renderSync();
+    await syncNow(true);
+    if (sync.error) return;
+    toast(created ? 'Sync is on. To add another device, copy the sync key in Settings.' : 'Sync is on. Texts from your other devices are here now.');
+  }
+
+  function stopSync() {
+    clearTimeout(sync.timer);
+    sync.cfg = null;
+    sync.remote = null;
+    sync.error = '';
+    sync.pending = null;
+    store.set('sync', null).catch(onStoreError);
+    renderSync();
+    toast('Sync is off on this device. Your texts stay here.');
+  }
+
+  async function copySyncKey() {
+    if (!sync.cfg) return;
+    const ok = await copyText(Core.makeSyncKey(sync.cfg.gistId, sync.cfg.token));
+    toast(ok ? 'Sync key copied. Paste it into Readout on your other device.' : 'Couldn’t copy the sync key.');
+  }
+
+  function renderSync() {
+    if (!el.syncSetup) return;
+    const on = !!sync.cfg;
+    el.syncSetup.hidden = on;
+    el.syncActive.hidden = !on;
+    el.syncConfirm.hidden = on || !sync.pending;
+    el.syncTokenLink.href = TOKEN_URL;
+    renderSyncStatus();
+  }
+
+  function renderSyncStatus(working) {
+    if (!el.syncStatus || !sync.cfg) return;
+    const who = sync.cfg.login ? ` as ${sync.cfg.login}` : '';
+    let msg;
+    if (working || sync.running) msg = 'Syncing…';
+    else if (sync.error) msg = syncMessage();
+    else if (sync.lastOk) msg = `Synced with GitHub${who}, ${Core.relativeTime(sync.lastOk)}.`;
+    else msg = `Connected to GitHub${who}.`;
+    if (sync.skipped) msg += ` ${sync.skipped === 1 ? 'One very long text stays' : sync.skipped + ' very long texts stay'} on this device only.`;
+    el.syncStatus.textContent = msg;
+    el.syncFixBtn.hidden = !STOPPED.has(sync.error) || sync.error === 'newer';
+    el.syncFixBtn.textContent = sync.error === 'missing' ? 'Set up sync again' : 'Use a new token';
+  }
+
+  // After a stop that needs the user: start over with the setup steps, keeping the texts.
+  async function fixSync() {
+    const cfg = sync.cfg;
+    const missing = sync.error === 'missing';
+    sync.cfg = null;
+    sync.error = '';
+    sync.remote = null;
+    store.set('sync', null).catch(onStoreError);
+    if (missing && cfg) {
+      // Another device may already have made a new gist; join it rather than starting a second one.
+      el.syncFixBtn.disabled = true;
+      setSyncMsg('Looking for your sync on GitHub…');
+      renderSync();
+      const id = await findSyncGist(cfg.token).catch(() => null);
+      el.syncFixBtn.disabled = false;
+      // The same gist can come back after a passing GitHub error; rejoin it if it's really there.
+      if (id && (id !== cfg.gistId || ((await isSyncGist(cfg.token, id).catch(() => null)) || {}).ok)) {
+        await startSync({ token: cfg.token, gistId: id, login: cfg.login }, false);
+        return;
+      }
+      setSyncMsg('');
+      sync.pending = { token: cfg.token, login: cfg.login };
+      renderSync();
+      return;
+    }
+    renderSync();
+    el.syncInput.focus();
   }
 
   /* ================= sheets ================= */
@@ -1920,6 +2579,7 @@
     }
     if (store.memoryOnly) parts.push(document.createTextNode(' This browser isn’t allowing storage, so texts disappear when you close the page.'));
     el.about.replaceChildren(...parts);
+    renderSync();
   }
 
   function buildDictLangs() {
@@ -2009,7 +2669,9 @@
       'pitchValue', 'moreSheet', 'pinLabel', 'settingsSheet', 'followToggle', 'awakeToggle', 'bgToggle', 'dictLang',
       'punctToggle', 'localToggleRow', 'localToggle', 'exportAllBtn', 'importBtn', 'about', 'toast', 'toastMsg',
       'toastAction', 'newBtn', 'search', 'docList', 'docEmpty', 'installBtn', 'settingsBtn', 'pastePlayBtn',
-      'welcomeOpenBtn', 'welcomeNoteBtn', 'themeColor', 'themeGroup', 'sizeGroup',
+      'welcomeOpenBtn', 'welcomeNoteBtn', 'themeColor', 'themeGroup', 'sizeGroup', 'syncSetup', 'syncActive',
+      'syncConfirm', 'syncTokenLink', 'syncInput', 'syncConnectBtn', 'syncSetupMsg', 'syncCreateBtn', 'syncCancelBtn',
+      'syncStatus', 'syncNowBtn', 'syncKeyBtn', 'syncOffBtn', 'syncFixBtn',
     ];
     for (const id of ids) el[id] = document.getElementById(id);
   }
@@ -2045,6 +2707,8 @@
       doc.titleLocked = !!v;
       doc.title = v || Core.deriveTitle(doc.text);
       doc.updatedAt = Date.now();
+      doc.titleAt = doc.updatedAt;
+      touch(doc, false);
       document.title = `${doc.title} | Readout`;
       scheduleSave(doc);
       renderLibrarySoon();
@@ -2152,6 +2816,14 @@
     }
 
     el.editor.addEventListener('input', onEditorInput);
+    el.editor.addEventListener('compositionstart', () => (editing.composing = true));
+    el.editor.addEventListener('blur', () => {
+      if (sync.dirty) syncSoon(800);
+    });
+    el.editor.addEventListener('compositionend', () => {
+      editing.composing = false;
+      editing.lastAt = Date.now();
+    });
     el.editor.addEventListener('keydown', (e) => {
       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
         e.preventDefault();
@@ -2168,6 +2840,32 @@
     el.pastePlayBtn.addEventListener('click', pasteAndPlay);
     el.welcomeOpenBtn.addEventListener('click', () => el.fileInput.click());
     el.welcomeNoteBtn.addEventListener('click', () => newDoc());
+
+    el.syncConnectBtn.addEventListener('click', connectSync);
+    el.syncInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        connectSync();
+      }
+    });
+    el.syncCreateBtn.addEventListener('click', createSyncGist);
+    el.syncCancelBtn.addEventListener('click', () => {
+      sync.pending = null;
+      renderSync();
+    });
+    el.syncNowBtn.addEventListener('click', () => syncNow(true));
+    el.syncKeyBtn.addEventListener('click', copySyncKey);
+    el.syncOffBtn.addEventListener('click', stopSync);
+    el.syncFixBtn.addEventListener('click', fixSync);
+    window.addEventListener('online', () => {
+      if (sync.error === 'offline' || sync.error === 'server') sync.retryAt = 0;
+      syncNow();
+    });
+    // Picks up changes from other devices while Readout is open, unless it's reading aloud.
+    setInterval(() => {
+      if (sync.cfg && document.visibilityState === 'visible' && !tts.playing && Date.now() - sync.lastTry > 55000) syncNow();
+      if (sync.cfg && el.settingsSheet.open) renderSyncStatus();
+    }, 15000);
 
     el.exportAllBtn.addEventListener('click', exportAll);
     el.importBtn.addEventListener('click', () => el.backupInput.click());
@@ -2284,8 +2982,10 @@
         flushDocs();
         if (state.current) savePositionNow();
         store.set('settings', state.settings).catch(() => {});
-      } else if (wake.reasons.size) {
-        wake.acquire();
+        if (sync.dirty) syncNow();
+      } else {
+        if (wake.reasons.size) wake.acquire();
+        if (Date.now() - sync.lastTry > 5000) syncNow();
       }
     });
     window.addEventListener('pagehide', () => {
@@ -2338,10 +3038,21 @@
     let docs = [];
     let positions = [];
     let saved = null;
+    let syncSaved = null;
     try {
       [docs, positions, saved] = await Promise.all([store.allDocs(), store.allPos(), store.get('settings')]);
+      [sync.device, syncSaved, sync.tombs] = await Promise.all([store.get('device'), store.get('sync'), store.get('tombs')]);
     } catch (e) {
       onStoreError(e);
+    }
+    if (!sync.device) {
+      sync.device = Core.uid();
+      store.set('device', sync.device).catch(onStoreError);
+    }
+    if (!sync.tombs || typeof sync.tombs !== 'object') sync.tombs = {};
+    if (syncSaved && syncSaved.token && syncSaved.gistId) {
+      sync.cfg = { token: syncSaved.token, gistId: syncSaved.gistId, login: syncSaved.login || '' };
+      sync.lastOk = syncSaved.lastOk || 0;
     }
     state.settings = Object.assign({}, DEFAULTS, saved || {});
     applyTheme();
@@ -2349,8 +3060,11 @@
     state.docs = (docs || []).filter((d) => d && typeof d.id === 'string' && typeof d.text === 'string');
     for (const p of positions || []) if (p && p.id) state.positions.set(p.id, p);
     mergeMirroredPositions();
+    adoptOldWelcome();
+    for (const d of state.docs) if (Core.seedVV(d)) store.putDoc(d).catch(onStoreError);
+    await claimDeviceId();
     if (!state.docs.length && !state.settings.seenWelcome) {
-      createDoc(WELCOME_TEXT, 'Welcome to Readout');
+      createWelcomeDoc();
       state.settings.seenWelcome = true;
       saveSettings();
     }
@@ -2364,7 +3078,43 @@
     registerServiceWorker();
     if (!tts.ok) toast('This browser can’t read aloud. Open Readout in Chrome.');
     if (store.memoryOnly) toast('This browser isn’t allowing storage, so texts won’t be saved.');
-    window.__readout = { state, tts, dict, Core };
+    window.__readout = { state, tts, dict, sync, editing, Core };
+    syncNow();
+  }
+
+  // Each open copy of Readout (a tab, the installed app) needs its own id for
+  // sync to tell their changes apart. The first copy keeps the saved id.
+  async function claimDeviceId() {
+    if (!navigator.locks || !navigator.locks.request) return;
+    const got = await new Promise((resolve) => {
+      navigator.locks
+        .request('readout-device-' + sync.device, { ifAvailable: true }, (lock) => {
+          resolve(!!lock);
+          return lock ? new Promise(() => {}) : undefined;
+        })
+        .catch(() => resolve(true));
+    });
+    if (!got) sync.device = Core.uid();
+  }
+
+  // Welcome texts from before sync existed got random ids. Give an unedited one
+  // the shared id so it matches the welcome text on other devices.
+  function adoptOldWelcome() {
+    if (state.docs.some((d) => d.id === 'welcome')) return;
+    const old = state.docs.find((d) => d.text === WELCOME_TEXT && !d.vv && !d.pinned);
+    if (!old) return;
+    const pos = state.positions.get(old.id);
+    removeDocLocally(old);
+    const doc = Object.assign({}, old, { id: 'welcome', changedAt: 1, vv: {}, tv: {} });
+    state.docs.push(doc);
+    store.putDoc(doc).catch(onStoreError);
+    if (pos) {
+      const p = Object.assign({}, pos, { id: 'welcome' });
+      state.positions.set('welcome', p);
+      mirrorPosition(p);
+      store.putPos(p).catch(onStoreError);
+    }
+    if (state.settings.lastDocId === old.id) state.settings.lastDocId = 'welcome';
   }
 
   const start = () =>
