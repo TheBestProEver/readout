@@ -1,0 +1,31 @@
+# Draws the PNG app icons from tools/make_icons.py and commits them.
+# Android needs PNG icons to install the app, and the tool that set up this repo can only commit text files.
+name: Build icons
+on:
+  push:
+    paths:
+      - "tools/make_icons.py"
+      - ".github/workflows/icons.yml"
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  icons:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Draw icons
+        run: |
+          pip install pillow
+          python tools/make_icons.py
+      - name: Commit icons
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add icons/*.png
+          if git diff --cached --quiet; then echo "Icons already up to date"; exit 0; fi
+          git commit -m "Build PNG icons"
+          git push

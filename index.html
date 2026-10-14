@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en" data-theme="system" data-size="m">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <title>Readout</title>
+  <meta name="description" content="Paste text and hear it read aloud. Dictate notes by voice.">
+  <meta name="theme-color" content="#F6F7F9" id="themeColor">
+  <meta name="color-scheme" content="light dark">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600&family=Literata:wght@400;500;600&display=swap">
+  <link rel="stylesheet" href="styles.css?v=1">
+  <script src="core.js?v=1" defer></script>
+  <script src="app.js?v=1" defer></script>
+</head>
+<body>
+  <svg xmlns="http://www.w3.org/2000/svg" width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+    <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10"/></symbol>
+    <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.7" class="fill"/><circle cx="12" cy="12" r="1.7" class="fill"/><circle cx="19" cy="12" r="1.7" class="fill"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path class="fill" d="M8 5.6v12.8c0 .8.9 1.3 1.6.9l10.2-6.4c.6-.4.6-1.3 0-1.7L9.6 4.7C8.9 4.3 8 4.8 8 5.6z"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24"><rect class="fill" x="6.5" y="5" width="4" height="14" rx="1.2"/><rect class="fill" x="13.5" y="5" width="4" height="14" rx="1.2"/></symbol>
+    <symbol id="i-prev" viewBox="0 0 24 24"><path d="M6.5 5.5v13"/><path class="fill" d="M19 6.4v11.2c0 .8-.9 1.2-1.5.8l-8-5.6c-.6-.4-.6-1.2 0-1.6l8-5.6c.6-.4 1.5 0 1.5.8z"/></symbol>
+    <symbol id="i-next" viewBox="0 0 24 24"><path d="M17.5 5.5v13"/><path class="fill" d="M5 6.4v11.2c0 .8.9 1.2 1.5.8l8-5.6c.6-.4.6-1.2 0-1.6l-8-5.6C5.9 5.2 5 5.6 5 6.4z"/></symbol>
+    <symbol id="i-mic" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21M8.5 21h7"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24"><rect class="fill" x="6.5" y="6.5" width="11" height="11" rx="2"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+    <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8.5" y="8.5" width="11.5" height="11.5" rx="2"/><path d="M15.5 8.5V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v7.5a2 2 0 0 0 2 2h2.5"/></symbol>
+    <symbol id="i-share" viewBox="0 0 24 24"><path d="M12 3.5v11M7.5 8L12 3.5 16.5 8M5 12.5V18a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-5.5"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11M7.5 10.5L12 15l4.5-4.5M5 19.5h14"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9.5 7V5a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v2M6.5 7l.9 12a2 2 0 0 0 2 1.8h5.2a2 2 0 0 0 2-1.8l.9-12"/></symbol>
+    <symbol id="i-pin" viewBox="0 0 24 24"><path d="M9 4h6l-1 5.5 3 2.5v2H7v-2l3-2.5L9 4zM12 14v6"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M7 3h7l5 5v11a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zM14 3v5h5"/></symbol>
+    <symbol id="i-paste" viewBox="0 0 24 24"><rect x="8.5" y="3.5" width="7" height="4" rx="1"/><path d="M8.5 5.5H7a2 2 0 0 0-2 2V19a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7.5a2 2 0 0 0-2-2h-1.5"/></symbol>
+    <symbol id="i-wrap" viewBox="0 0 24 24"><path d="M4 6h16M4 12h13a3 3 0 0 1 0 6h-4M15 16l-2 2 2 2M4 18h5"/></symbol>
+    <symbol id="i-restart" viewBox="0 0 24 24"><path d="M4.5 12a7.5 7.5 0 1 0 2.2-5.3M4.5 4v4.5H9"/></symbol>
+    <symbol id="i-locate" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.5"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3"/></symbol>
+    <symbol id="i-voice" viewBox="0 0 24 24"><path d="M4 9.5v5h3.5L12 19V5L7.5 9.5H4zM15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/></symbol>
+  </svg>
+
+  <div class="app" id="app">
+    <aside class="library" id="library" aria-label="Your texts">
+      <div class="library-head">
+        <span class="wordmark" aria-hidden="true"><span class="wordmark-mark"></span>Readout</span>
+        <button class="btn btn-primary btn-sm" id="newBtn" type="button"><svg class="ic"><use href="#i-plus"/></svg>New</button>
+      </div>
+      <label class="search">
+        <svg class="ic"><use href="#i-search"/></svg>
+        <input id="search" type="search" placeholder="Search your texts" aria-label="Search your texts" autocomplete="off">
+      </label>
+      <ul class="doc-list" id="docList"></ul>
+      <p class="doc-empty" id="docEmpty" hidden></p>
+      <div class="library-foot">
+        <button class="btn btn-quiet" id="installBtn" type="button" hidden><svg class="ic"><use href="#i-download"/></svg>Install app</button>
+        <button class="btn btn-quiet" id="settingsBtn" type="button"><svg class="ic"><use href="#i-sliders"/></svg>Settings</button>
+      </div>
+    </aside>
+    <div class="scrim" id="scrim" hidden></div>
+
+    <main class="main" id="main">
+      <header class="topbar">
+        <button class="icon-btn menu-btn" id="menuBtn" type="button" aria-label="Your texts" aria-controls="library" aria-expanded="false"><svg class="ic"><use href="#i-menu"/></svg></button>
+        <input class="doc-title" id="docTitle" aria-label="Title" spellcheck="false" autocomplete="off" maxlength="120">
+        <button class="btn btn-quiet mode-btn" id="modeBtn" type="button">Edit</button>
+        <button class="icon-btn" id="moreBtn" type="button" aria-label="More actions" aria-haspopup="dialog"><svg class="ic"><use href="#i-more"/></svg></button>
+      </header>
+
+      <section class="stage" id="stage">
+        <div class="welcome" id="welcome" hidden>
+          <h1 class="welcome-title">Paste anything and hear it read aloud.</h1>
+          <div class="welcome-actions">
+            <button class="btn btn-primary btn-lg" id="pastePlayBtn" type="button"><svg class="ic"><use href="#i-play"/></svg>Paste and play</button>
+            <button class="btn btn-lg" id="welcomeOpenBtn" type="button"><svg class="ic"><use href="#i-file"/></svg>Open a file</button>
+            <button class="btn btn-lg" id="welcomeNoteBtn" type="button"><svg class="ic"><use href="#i-mic"/></svg>Write or dictate a note</button>
+          </div>
+          <p class="welcome-note">Texts are saved in this browser on this device.</p>
+        </div>
+        <article class="reader" id="reader" aria-label="Text"></article>
+        <div class="editor-wrap" id="editorWrap" hidden>
+          <textarea class="editor" id="editor" aria-label="Text" placeholder="Paste or type here, or tap Dictate and talk." spellcheck="true" autocapitalize="sentences"></textarea>
+        </div>
+      </section>
+
+      <div class="dictation" id="dictation" hidden>
+        <span class="rec-dot" aria-hidden="true"></span>
+        <span class="dictation-text" role="status" aria-live="polite"><span class="dictation-label" id="dictLabel">Listening</span> <span class="dictation-interim" id="dictInterim"></span></span>
+        <button class="btn btn-sm" id="dictStopBtn" type="button"><svg class="ic"><use href="#i-stop"/></svg>Stop</button>
+      </div>
+
+      <footer class="dock" id="dock">
+        <div class="player" id="player">
+          <input class="scrub" id="scrub" type="range" min="0" max="0" value="0" step="1" aria-label="Position in text">
+          <div class="player-meta"><span id="progressPct">0%</span><span id="timeLeft"></span></div>
+          <div class="transport">
+            <button class="speed-btn" id="speedBtn" type="button" aria-haspopup="dialog" aria-label="Speed and voice"><span id="speedLabel">1×</span></button>
+            <button class="icon-btn icon-btn-lg" id="prevBtn" type="button" aria-label="Previous sentence"><svg class="ic"><use href="#i-prev"/></svg></button>
+            <button class="play-btn" id="playBtn" type="button" aria-label="Play"><svg class="ic"><use href="#i-play" id="playIcon"/></svg></button>
+            <button class="icon-btn icon-btn-lg" id="nextBtn" type="button" aria-label="Next sentence"><svg class="ic"><use href="#i-next"/></svg></button>
+            <button class="icon-btn locate-btn" id="locateBtn" type="button" aria-label="Show the sentence being read" hidden><svg class="ic"><use href="#i-locate"/></svg></button>
+          </div>
+        </div>
+        <div class="edit-tools" id="editTools" hidden>
+          <button class="btn" id="pasteBtn" type="button"><svg class="ic"><use href="#i-paste"/></svg>Paste</button>
+          <button class="btn" id="openBtn" type="button"><svg class="ic"><use href="#i-file"/></svg>Open file</button>
+          <button class="btn btn-primary" id="dictateBtn" type="button" aria-pressed="false"><svg class="ic"><use href="#i-mic"/></svg>Dictate</button>
+        </div>
+      </footer>
+    </main>
+  </div>
+
+  <input type="file" id="fileInput" accept=".txt,.text,.md,.markdown,.pdf,text/plain,text/markdown,application/pdf" multiple hidden>
+  <input type="file" id="backupInput" accept=".json,application/json" hidden>
+
+  <dialog class="sheet" id="speedSheet" aria-labelledby="speedSheetTitle">
+    <div class="sheet-head">
+      <h2 class="sheet-title" id="speedSheetTitle">Speed and voice</h2>
+      <button class="icon-btn" type="button" data-close aria-label="Close"><svg class="ic"><use href="#i-close"/></svg></button>
+    </div>
+    <div class="rate">
+      <button class="icon-btn rate-step" id="slowerBtn" type="button" aria-label="Slower"><span class="rate-sign" aria-hidden="true">−</span></button>
+      <output class="rate-readout" id="rateReadout" for="rateSlider">1.00×</output>
+      <button class="icon-btn rate-step" id="fasterBtn" type="button" aria-label="Faster"><span class="rate-sign" aria-hidden="true">+</span></button>
+    </div>
+    <input class="dial" id="rateSlider" type="range" min="0.5" max="4" step="0.05" value="1" aria-label="Speed">
+    <div class="dial-scale" aria-hidden="true"><span>0.5×</span><span>1×</span><span>2×</span><span>3×</span><span>4×</span></div>
+    <div class="chips" id="rateChips" role="group" aria-label="Speed presets"></div>
+
+    <div class="field">
+      <label class="field-label" for="voiceSelect">Voice</label>
+      <div class="field-row">
+        <select id="voiceSelect" class="select"></select>
+        <button class="btn" id="previewBtn" type="button"><svg class="ic"><use href="#i-voice"/></svg>Preview</button>
+      </div>
+      <p class="field-hint" id="voiceHint"></p>
+    </div>
+    <div class="field">
+      <label class="field-label" for="pitchSlider">Pitch <span class="field-value" id="pitchValue">Normal</span></label>
+      <input class="dial dial-thin" id="pitchSlider" type="range" min="0.5" max="1.5" step="0.05" value="1">
+    </div>
+  </dialog>
+
+  <dialog class="sheet" id="moreSheet" aria-label="More actions">
+    <div class="sheet-head">
+      <h2 class="sheet-title" id="moreTitle">This text</h2>
+      <button class="icon-btn" type="button" data-close aria-label="Close"><svg class="ic"><use href="#i-close"/></svg></button>
+    </div>
+    <div class="menu">
+      <button class="menu-item" type="button" data-act="copy"><svg class="ic"><use href="#i-copy"/></svg>Copy text</button>
+      <button class="menu-item" type="button" data-act="share"><svg class="ic"><use href="#i-share"/></svg>Share</button>
+      <button class="menu-item" type="button" data-act="txt"><svg class="ic"><use href="#i-download"/></svg>Download as .txt</button>
+      <button class="menu-item" type="button" data-act="md"><svg class="ic"><use href="#i-download"/></svg>Download as .md</button>
+      <button class="menu-item" type="button" data-act="reflow"><svg class="ic"><use href="#i-wrap"/></svg>Clean up line breaks</button>
+      <button class="menu-item" type="button" data-act="restart"><svg class="ic"><use href="#i-restart"/></svg>Start over from the top</button>
+      <button class="menu-item" type="button" data-act="pin"><svg class="ic"><use href="#i-pin"/></svg><span id="pinLabel">Pin to top</span></button>
+      <button class="menu-item menu-item-danger" type="button" data-act="delete"><svg class="ic"><use href="#i-trash"/></svg>Delete</button>
+    </div>
+  </dialog>
+
+  <dialog class="sheet sheet-tall" id="settingsSheet" aria-labelledby="settingsTitle">
+    <div class="sheet-head">
+      <h2 class="sheet-title" id="settingsTitle">Settings</h2>
+      <button class="icon-btn" type="button" data-close aria-label="Close"><svg class="ic"><use href="#i-close"/></svg></button>
+    </div>
+
+    <section class="settings-group">
+      <h3 class="group-title">Look</h3>
+      <div class="field">
+        <span class="field-label" id="themeLabel">Theme</span>
+        <div class="segmented" role="radiogroup" aria-labelledby="themeLabel" id="themeGroup">
+          <label><input type="radio" name="theme" value="system"><span>System</span></label>
+          <label><input type="radio" name="theme" value="light"><span>Light</span></label>
+          <label><input type="radio" name="theme" value="dark"><span>Dark</span></label>
+        </div>
+      </div>
+      <div class="field">
+        <span class="field-label" id="sizeLabel">Text size</span>
+        <div class="segmented" role="radiogroup" aria-labelledby="sizeLabel" id="sizeGroup">
+          <label><input type="radio" name="size" value="s"><span class="sz sz-s">A</span></label>
+          <label><input type="radio" name="size" value="m"><span class="sz sz-m">A</span></label>
+          <label><input type="radio" name="size" value="l"><span class="sz sz-l">A</span></label>
+          <label><input type="radio" name="size" value="xl"><span class="sz sz-xl">A</span></label>
+        </div>
+      </div>
+    </section>
+
+    <section class="settings-group">
+      <h3 class="group-title">Listening</h3>
+      <label class="toggle"><span><span class="toggle-title">Follow along</span><span class="toggle-desc">Scroll to the sentence being read.</span></span><input type="checkbox" id="followToggle"><span class="switch" aria-hidden="true"></span></label>
+      <label class="toggle"><span><span class="toggle-title">Keep the screen on while reading</span><span class="toggle-desc">Phones stop web speech when the screen turns off.</span></span><input type="checkbox" id="awakeToggle"><span class="switch" aria-hidden="true"></span></label>
+      <label class="toggle"><span><span class="toggle-title">Try to keep reading when locked</span><span class="toggle-desc">Experimental. Adds lock-screen controls and asks the phone to keep Readout running.</span></span><input type="checkbox" id="bgToggle"><span class="switch" aria-hidden="true"></span></label>
+    </section>
+
+    <section class="settings-group">
+      <h3 class="group-title">Dictation</h3>
+      <div class="field">
+        <label class="field-label" for="dictLang">Language</label>
+        <select id="dictLang" class="select"></select>
+      </div>
+      <label class="toggle"><span><span class="toggle-title">Spoken punctuation</span><span class="toggle-desc">Say “comma”, “period”, “question mark”, or “new paragraph”.</span></span><input type="checkbox" id="punctToggle"><span class="switch" aria-hidden="true"></span></label>
+      <label class="toggle" id="localToggleRow" hidden><span><span class="toggle-title">Prefer on-device recognition</span><span class="toggle-desc">Keeps your voice on this device and works offline, once Chrome downloads the language pack.</span></span><input type="checkbox" id="localToggle"><span class="switch" aria-hidden="true"></span></label>
+    </section>
+
+    <section class="settings-group">
+      <h3 class="group-title">Backup</h3>
+      <p class="group-desc">Your texts live in this browser. Export a backup before clearing browser data or switching phones.</p>
+      <div class="field-row">
+        <button class="btn" id="exportAllBtn" type="button"><svg class="ic"><use href="#i-download"/></svg>Export all texts</button>
+        <button class="btn" id="importBtn" type="button"><svg class="ic"><use href="#i-file"/></svg>Import a backup</button>
+      </div>
+    </section>
+
+    <p class="about" id="about"></p>
+  </dialog>
+
+  <div class="toast" id="toast" hidden>
+    <span class="toast-msg" id="toastMsg" role="status" aria-live="polite"></span>
+    <button class="toast-action" id="toastAction" type="button" hidden></button>
+  </div>
+</body>
+</html>
