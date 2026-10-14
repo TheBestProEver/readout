@@ -109,6 +109,44 @@ test('reflow joins wrapped lines and keeps paragraphs', () => {
   assert.strictEqual(C.reflow('infor-\nmation is key'), 'information is key');
 });
 
+test('stripRepeats removes running headers, footers, and page numbers', () => {
+  const words = ['apples', 'rivers', 'lanterns', 'harbors', 'meadows', 'engines', 'violins', 'glaciers'];
+  const pages = words.map((w, i) => {
+    const n = i + 1;
+    const body = Array.from({ length: 10 }, (_, k) => `Line ${k + 1} of the page about ${w}, which should stay put.`);
+    return [n % 2 ? `The Art of Reading  ${n}` : `${n}  Chapter 2: Slow Books`, ...body, `Page ${n} of 8`].join('\n');
+  });
+  const out = C.stripRepeats(pages);
+  words.forEach((w, i) => {
+    assert.strictEqual(out[i].split('\n').length, 10, 'keeps all body lines: ' + out[i]);
+    assert.ok(out[i].includes(`Line 1 of the page about ${w}`) && out[i].includes(`Line 10 of the page about ${w}`));
+    assert.ok(!/Page \d of 8|Art of Reading|Slow Books/.test(out[i]), 'drops running heads and page numbers: ' + out[i]);
+  });
+  // A heading on only one page stays, and so does everything in a short document.
+  const two = C.stripRepeats(['Introduction\nWhy we read.', 'Methods\nHow we read.\n2']);
+  assert.deepStrictEqual(two, ['Introduction\nWhy we read.', 'Methods\nHow we read.']);
+  assert.deepStrictEqual(C.stripRepeats(['iv\nPreface text.']), ['Preface text.']);
+});
+
+test('stripRepeats keeps numbered headings, words, and years', () => {
+  const pages = [1, 2, 3, 4, 5, 6].map((n) =>
+    [`Problem ${n} (10 points)`, ...Array.from({ length: 9 }, (_, k) => `Work line ${k} for problem ${n} goes here.`), `Smith ${n}`].join('\n')
+  );
+  const out = C.stripRepeats(pages);
+  out.forEach((p, i) => {
+    assert.ok(p.startsWith(`Problem ${i + 1} (10 points)`), 'keeps the heading: ' + p.slice(0, 40));
+    assert.ok(!/Smith/.test(p), 'drops the running foot');
+  });
+  for (const line of ['civil', 'ill', 'Mix', '2024']) assert.strictEqual(C.stripRepeats([line + '\nBody.'])[0], line + '\nBody.', line);
+  for (const line of ['12', '- 12 -', 'Page 3 of 9', 'iv', 'XL']) assert.strictEqual(C.stripRepeats([line + '\nBody.'])[0], 'Body.', line);
+});
+
+test('cleanOcr drops symbol junk and keeps words, dates, and numbers', () => {
+  assert.strictEqual(C.cleanOcr('Real sentence here.\n|| — ~ ||\n= =\nI think so.\n'), 'Real sentence here.\nI think so.');
+  assert.strictEqual(C.cleanOcr('on July 20, 1969.\nTotal due: $1,250.00\ny = 3x + 2\n«— | ;'), 'on July 20, 1969.\nTotal due: $1,250.00\ny = 3x + 2');
+  assert.strictEqual(C.letterCount('a1 b2 c'), 3);
+});
+
 test('deriveTitle', () => {
   assert.strictEqual(C.deriveTitle('\n\n# My heading\nbody'), 'My heading');
   assert.strictEqual(C.deriveTitle(''), 'Untitled');

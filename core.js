@@ -88,6 +88,68 @@
       .trim();
   }
 
+  /* ---------- PDF pages ---------- */
+
+  function letterCount(text) {
+    const m = String(text || '').match(/\p{L}/gu);
+    return m ? m.length : 0;
+  }
+
+  const PAGE_NUMBER = /^(?:[Pp]age\s+|PAGE\s+)?[-–—([]?\s*(?:\d{1,3}|(?=[ivxlc])c{0,3}(?:xc|xl|l?x{0,3})(?:ix|iv|v?i{0,3})|(?=[IVXLC])C{0,3}(?:XC|XL|L?X{0,3})(?:IX|IV|V?I{0,3}))\s*[-–—)\]]?(?:\s*(?:of|OF|\/)\s*\d{1,4})?$/;
+
+  // Removes running headers, footers, and page numbers, so they aren't read out on
+  // every page: short lines near the top or bottom of a page that are page numbers,
+  // or that repeat (numbers aside) on many pages.
+  function stripRepeats(pages) {
+    // Running heads differ only by the page number at their start or end.
+    const shape = (line) => line.toLowerCase().replace(/\s+/g, ' ').trim().replace(/^\d+\s*|\s*\d+$/g, '#');
+    const split = pages.map((p) => String(p || '').split('\n'));
+    const edges = split.map((lines) => {
+      const filled = [];
+      lines.forEach((l, i) => l.trim() && filled.push(i));
+      const edge = filled.length > 8 ? 3 : 1; // on a short page, only its first and last line
+      return new Set(filled.slice(0, edge).concat(filled.slice(-edge)));
+    });
+    const counts = new Map();
+    split.forEach((lines, p) => {
+      const seen = new Set();
+      for (const i of edges[p]) {
+        const k = shape(lines[i]);
+        if (k.length > 80 || seen.has(k)) continue;
+        seen.add(k);
+        counts.set(k, (counts.get(k) || 0) + 1);
+      }
+    });
+    const need = Math.max(3, Math.ceil(pages.length * 0.4));
+    return split.map((lines, p) =>
+      lines
+        .filter((l, i) => {
+          if (!edges[p].has(i)) return true;
+          const k = shape(l);
+          if (PAGE_NUMBER.test(l.trim())) return false;
+          return !(pages.length >= 3 && k.length <= 80 && counts.get(k) >= need);
+        })
+        .join('\n')
+    );
+  }
+
+  // Text read from pictures picks up stray marks from borders, smudges, and
+  // figures; this drops lines that are mostly symbols (dates and numbers stay).
+  function cleanOcr(text) {
+    return String(text || '')
+      .split('\n')
+      .filter((l) => {
+        const t = l.replace(/\s/g, '');
+        if (!t) return true;
+        const m = t.match(/[\p{L}\p{N}]/gu);
+        const n = m ? m.length : 0;
+        return n >= 2 && n / t.length >= 0.5;
+      })
+      .join('\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
   /* ---------- sentence chunking ---------- */
 
   const segmenters = new Map();
@@ -702,6 +764,9 @@
     isSoftBreak,
     maskSoftBreaks,
     reflow,
+    letterCount,
+    stripRepeats,
+    cleanOcr,
     splitSentences,
     chunkText,
     prefixLengths,

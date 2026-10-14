@@ -3,10 +3,18 @@
   'use strict';
 
   const Core = window.ReadoutCore;
-  const VERSION = '1.1.0';
+  const VERSION = '1.2.0';
   const CONFIG = Object.assign(
     {
-      pdfjsBase: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@5.6.205/build/',
+      pdfjsBase: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@5.6.205/legacy/build/', // the build that also runs on older Chrome
+      pdfjsWasm: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@5.6.205/wasm/',
+      // Reading text in scanned pages and photos (Tesseract), loaded on first use
+      ocrScript: 'https://cdn.jsdelivr.net/npm/tesseract.js@7.0.0/dist/tesseract.min.js',
+      ocrWorker: 'https://cdn.jsdelivr.net/npm/tesseract.js@7.0.0/dist/worker.min.js',
+      ocrCore: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@7.0.0',
+      ocrLang: 'eng',
+      ocrLangPath: 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/eng/4.0.0_best_int',
+      ocrStall: 60000, // ms without progress before giving up on getting OCR ready
       githubApi: 'https://api.github.com',
       netWait: 45000, // ms to wait for a reply to start
       netStall: 30000, // ms a reply may pause before giving up
@@ -38,6 +46,7 @@
     cps: 14.5, // learned speaking speed in characters per second at 1x
     lastDocId: null,
     seenWelcome: false,
+    ocrOk: false, // agreed to the one-time download for reading scanned pages
   };
 
   const RATE_PRESETS = [0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3];
@@ -1643,38 +1652,290 @@
       .replace(/\n{3,}/g, '\n\n');
   }
 
+  function userError(message) {
+    return Object.assign(new Error(message), { user: message });
+  }
+
+  let fileNote = ''; // replaces the usual "Ready" message after opening a file
+
   async function pdfToText(file) {
     toast('Reading the PDF…');
     const lib = await loadPdfjs();
-    const pdf = await lib.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
-    const pages = [];
-    for (let p = 1; p <= pdf.numPages; p++) {
-      if (pdf.numPages > 4 && p % 5 === 0) toast(`Reading the PDF, page ${p} of ${pdf.numPages}…`);
-      const page = await pdf.getPage(p);
-      const content = await page.getTextContent();
-      pages.push(pageText(content.items));
-      if (page.cleanup) page.cleanup();
+    let pdf;
+    try {
+      // wasmUrl lets pdf.js decode JPEG 2000 page images, which many scanned PDFs use.
+      pdf = await lib.getDocument({ data: new Uint8Array(await file.arrayBuffer()), wasmUrl: CONFIG.pdfjsWasm }).promise;
+    } catch (e) {
+      if (e && e.name === 'PasswordException') throw userError(`“${file.name}” is password-protected, so Readout can’t open it.`);
+      throw e;
     }
     try {
-      await pdf.destroy();
-    } catch (e) {
-      /* ignore */
+      const n = pdf.numPages;
+      const pages = [];
+      for (let p = 1; p <= n; p++) {
+        if (n > 4 && p % 5 === 0) toast(`Reading the PDF, page ${p} of ${n}…`);
+        const page = await pdf.getPage(p);
+        const content = await page.getTextContent();
+        pages.push(pageText(content.items));
+        if (page.cleanup) page.cleanup();
+      }
+      // A scanned PDF has no text, only pictures of pages (sometimes with a repeated
+      // stamp or header, so look after removing those). A few sparse pages are
+      // usually covers, blank pages, or figures; many picture pages mean a scan.
+      const sparse = [];
+      Core.stripRepeats(pages).forEach((t, i) => Core.letterCount(t) < 40 && sparse.push(i + 1));
+      const need = Math.max(1, Math.ceil(n * 0.3));
+      const pictures = sparse.length >= need ? await picturePages(lib, pdf, sparse, need) : [];
+      if (pictures.length && (await askOcr(`“${file.name}” is scanned pages`))) {
+        try {
+          await ocrPdfPages(pdf, pictures, pages);
+        } catch (e) {
+          console.warn('Readout OCR error', e);
+          if (!pages.some((t) => Core.letterCount(t) >= 40)) throw e;
+          fileNote = 'Couldn’t read the pictures in this PDF, so only its text is here.';
+        }
+      }
+      return Core.reflow(Core.stripRepeats(pages).join('\n\n'));
+    } finally {
+      try {
+        await pdf.destroy();
+      } catch (e) {
+        /* ignore */
+      }
     }
-    return Core.reflow(pages.join('\n\n'));
+  }
+
+  // Of the sparse pages, the ones worth reading as pictures: those that draw an image.
+  // Checking means decoding the page, so once enough images are found to call the
+  // PDF a scan, the rest are assumed to be pictures too (blank ones just come back empty).
+  async function picturePages(lib, pdf, sparse, need) {
+    const IMAGE_OPS = new Set(
+      ['paintImageXObject', 'paintInlineImageXObject', 'paintImageMaskXObject', 'paintImageXObjectRepeat', 'paintInlineImageXObjectGroup', 'paintImageMaskXObjectGroup', 'paintImageMaskXObjectRepeat']
+        .map((k) => lib.OPS && lib.OPS[k])
+        .filter((v) => v !== undefined)
+    );
+    const out = [];
+    let found = 0;
+    for (let i = 0; i < sparse.length; i++) {
+      if (found >= need) {
+        out.push(...sparse.slice(i));
+        break;
+      }
+      const page = await pdf.getPage(sparse[i]);
+      let image = true;
+      try {
+        const ops = await page.getOperatorList();
+        image = ops.fnArray.some((f) => IMAGE_OPS.has(f));
+      } catch (e) {
+        /* can't tell: try reading it */
+      }
+      if (page.cleanup) page.cleanup();
+      if (image) {
+        found++;
+        out.push(sparse[i]);
+      }
+    }
+    return found >= need ? out : [];
+  }
+
+  /* ================= reading text in pictures ================= */
+
+  // Scanned pages and photos are pictures with no text. Tesseract finds the words
+  // on this device. It loads on first use, about 5 MB, and is cached after that.
+  let ocrLibPromise = null;
+  function loadOcr() {
+    if (!ocrLibPromise) {
+      ocrLibPromise = new Promise((resolve, reject) => {
+        if (window.Tesseract) {
+          resolve(window.Tesseract);
+          return;
+        }
+        const s = document.createElement('script');
+        s.src = CONFIG.ocrScript;
+        s.crossOrigin = 'anonymous';
+        s.onload = () => (window.Tesseract ? resolve(window.Tesseract) : reject(new Error('Tesseract missing')));
+        s.onerror = () => reject(new Error('Tesseract failed to load'));
+        document.head.appendChild(s);
+      }).catch((e) => {
+        ocrLibPromise = null;
+        throw e;
+      });
+    }
+    return ocrLibPromise;
+  }
+
+  // Tesseract's own promise never settles if its files fail to download, so
+  // failures and long stalls are caught here instead.
+  async function startOcr() {
+    toast('Getting ready to read the pictures…', { sticky: true });
+    const lib = await loadOcr();
+    return new Promise((resolve, reject) => {
+      let done = false;
+      let stall = null;
+      const fail = (e) => {
+        if (done) return;
+        done = true;
+        clearTimeout(stall);
+        reject(e instanceof Error ? e : new Error(String(e)));
+      };
+      const alive = () => {
+        clearTimeout(stall);
+        if (!done) stall = setTimeout(() => fail(new Error('OCR setup stalled')), CONFIG.ocrStall);
+      };
+      alive();
+      lib
+        .createWorker(CONFIG.ocrLang, 1, {
+          workerPath: CONFIG.ocrWorker,
+          corePath: CONFIG.ocrCore,
+          langPath: CONFIG.ocrLangPath,
+          errorHandler: fail,
+          logger: (m) => {
+            alive();
+            if (!done && m && /^loading/.test(m.status) && m.progress > 0 && m.progress < 1) {
+              toast(`Getting ready to read the pictures… ${Math.round(m.progress * 100)}%`, { sticky: true });
+            }
+          },
+        })
+        .then((worker) => {
+          if (done) {
+            worker.terminate().catch(() => {});
+            return;
+          }
+          done = true;
+          clearTimeout(stall);
+          resolve(worker);
+        }, fail);
+    });
+  }
+
+  // Asks once before the first download; after a yes, scanned files just open.
+  function askOcr(what) {
+    if (state.settings.ocrOk) return Promise.resolve(true);
+    hideToast();
+    el.ocrWhat.textContent = what;
+    openSheet(el.ocrSheet);
+    return new Promise((resolve) => {
+      const finish = (ok) => {
+        el.ocrSheet.removeEventListener('close', onClose);
+        el.ocrYesBtn.removeEventListener('click', onYes);
+        if (ok) {
+          state.settings.ocrOk = true;
+          saveSettings();
+        }
+        closeSheet(el.ocrSheet);
+        resolve(ok);
+      };
+      const onYes = () => finish(true);
+      const onClose = () => finish(false);
+      el.ocrSheet.addEventListener('close', onClose);
+      el.ocrYesBtn.addEventListener('click', onYes);
+    });
+  }
+
+  function ocrProgress(job, i, n) {
+    toast(n > 1 ? `Reading the text in page ${i} of ${n}…` : 'Reading the text in the picture…', {
+      sticky: true,
+      action: n > 1 ? 'Stop' : '',
+      onAction: () => (job.stop = true),
+    });
+  }
+
+  // Draws a PDF page about 2000 px wide, sharp enough for the text to be read.
+  async function renderPage(page) {
+    const base = page.getViewport({ scale: 1 });
+    const viewport = page.getViewport({ scale: Core.clamp(2000 / base.width, 1, 4) });
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.ceil(viewport.width);
+    canvas.height = Math.ceil(viewport.height);
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    await page.render({ canvasContext: ctx, viewport, background: 'white' }).promise;
+    return canvas;
+  }
+
+  // Reads the picture pages in order. A failure part way keeps the pages read so
+  // far; it only counts as an error if nothing could be read at all. Long jobs keep
+  // the screen on, since a locked phone pauses the page.
+  async function ocrPdfPages(pdf, list, pages) {
+    const job = { stop: false };
+    let worker = null;
+    let read = 0;
+    wake.want('ocr', true);
+    try {
+      worker = await startOcr();
+      for (let i = 0; i < list.length && !job.stop; i++) {
+        ocrProgress(job, i + 1, list.length);
+        const k = list[i] - 1;
+        try {
+          const page = await pdf.getPage(list[i]);
+          const canvas = await renderPage(page);
+          const { data } = await worker.recognize(canvas);
+          canvas.width = canvas.height = 0;
+          if (page.cleanup) page.cleanup();
+          const text = Core.cleanOcr(data.text);
+          if (Core.letterCount(text) > Core.letterCount(pages[k])) pages[k] = text; // keep a page's own text if it was better
+          read++;
+        } catch (e) {
+          if (!read) throw e;
+          console.warn('Readout OCR stopped at page', list[i], e);
+          break;
+        }
+      }
+    } finally {
+      if (worker) worker.terminate().catch(() => {});
+      wake.want('ocr', false);
+      hideToast();
+    }
+  }
+
+  // Photos of pages: decoded by the browser (so phone photos come out the right
+  // way up) and scaled to about 12 megapixels, which reads well and quickly.
+  // Long screenshots keep their width, since the limit is on area.
+  async function imageToText(file) {
+    if (!(await askOcr(`“${file.name}” is a picture`))) return '';
+    let bmp;
+    try {
+      bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
+    } catch (e) {
+      throw userError(`Readout can’t open “${file.name}”. Try a JPEG or PNG photo.`);
+    }
+    const scale = Math.min(1, Math.sqrt(12e6 / (bmp.width * bmp.height)), 16000 / Math.max(bmp.width, bmp.height));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(bmp.width * scale));
+    canvas.height = Math.max(1, Math.round(bmp.height * scale));
+    canvas.getContext('2d').drawImage(bmp, 0, 0, canvas.width, canvas.height);
+    if (bmp.close) bmp.close();
+    const job = { stop: false };
+    let worker = null;
+    wake.want('ocr', true);
+    try {
+      worker = await startOcr();
+      ocrProgress(job, 1, 1);
+      const { data } = await worker.recognize(canvas);
+      return Core.reflow(Core.cleanOcr(data.text));
+    } finally {
+      canvas.width = canvas.height = 0;
+      if (worker) worker.terminate().catch(() => {});
+      wake.want('ocr', false);
+      hideToast();
+    }
   }
 
   async function handleFiles(fileList) {
     const files = Array.from(fileList || []);
     el.fileInput.value = '';
+    fileNote = '';
     if (!files.length) return;
     let last = null;
     let added = 0;
     for (const f of files) {
       try {
         const isPdf = f.type === 'application/pdf' || /\.pdf$/i.test(f.name);
-        const text = isPdf ? await pdfToText(f) : Core.normalizeText(await f.text());
+        const isImage = /^image\//.test(f.type) || /\.(png|jpe?g|webp|gif|bmp)$/i.test(f.name);
+        const text = isPdf ? await pdfToText(f) : isImage ? await imageToText(f) : Core.normalizeText(await f.text());
         if (!text.trim()) {
-          toast(`“${f.name}” has no text Readout can read. Scanned PDFs are images, not text.`);
+          toast(isPdf || isImage ? `No text to read in “${f.name}”.` : `“${f.name}” is empty.`);
           continue;
         }
         const title = f.name.replace(/\.[^.]+$/, '');
@@ -1693,14 +1954,15 @@
         added++;
       } catch (e) {
         console.warn('Readout file error', e);
-        toast(`Couldn’t open “${f.name}”.${navigator.onLine === false ? ' Opening a PDF needs a connection the first time.' : ''}`);
+        hideToast();
+        toast(e && e.user ? e.user : `Couldn’t open “${f.name}”.${navigator.onLine === false ? ' Opening a PDF or picture needs a connection the first time.' : ''}`);
       }
     }
     if (last) {
       flushDocs();
       openDoc(last.id, { mode: 'listen' });
       closeDrawer();
-      toast(added > 1 ? `Added ${added} files.` : 'Ready. Press play to listen.');
+      toast(added > 1 ? `Added ${added} files.` : fileNote || 'Ready. Press play to listen.');
     }
   }
 
@@ -2612,12 +2874,15 @@
     toastHandler = o.onAction || null;
     el.toastAction.hidden = !o.action;
     el.toastAction.textContent = o.action || '';
+    const shown = !el.toast.hidden;
     el.toast.hidden = false;
-    el.toast.style.animation = 'none';
-    void el.toast.offsetWidth;
-    el.toast.style.animation = '';
+    if (!(o.sticky && shown)) {
+      el.toast.style.animation = 'none';
+      void el.toast.offsetWidth;
+      el.toast.style.animation = '';
+    }
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(hideToast, o.action ? 6500 : 4000);
+    if (!o.sticky) toastTimer = setTimeout(hideToast, o.action ? 6500 : 4000);
   }
   function hideToast() {
     el.toast.hidden = true;
@@ -2671,7 +2936,7 @@
       'toastAction', 'newBtn', 'search', 'docList', 'docEmpty', 'installBtn', 'settingsBtn', 'pastePlayBtn',
       'welcomeOpenBtn', 'welcomeNoteBtn', 'themeColor', 'themeGroup', 'sizeGroup', 'syncSetup', 'syncActive',
       'syncConfirm', 'syncTokenLink', 'syncInput', 'syncConnectBtn', 'syncSetupMsg', 'syncCreateBtn', 'syncCancelBtn',
-      'syncStatus', 'syncNowBtn', 'syncKeyBtn', 'syncOffBtn', 'syncFixBtn',
+      'syncStatus', 'syncNowBtn', 'syncKeyBtn', 'syncOffBtn', 'syncFixBtn', 'ocrSheet', 'ocrWhat', 'ocrYesBtn',
     ];
     for (const id of ids) el[id] = document.getElementById(id);
   }
@@ -2802,7 +3067,7 @@
     el.previewBtn.addEventListener('click', previewVoice);
     el.pitchSlider.addEventListener('input', () => setPitch(el.pitchSlider.value));
 
-    for (const d of [el.speedSheet, el.moreSheet, el.settingsSheet]) {
+    for (const d of [el.speedSheet, el.moreSheet, el.settingsSheet, el.ocrSheet]) {
       d.addEventListener('click', (e) => {
         if (e.target.closest('[data-close]')) {
           closeSheet(d);

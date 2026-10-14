@@ -13,9 +13,9 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600&family=Literata:wght@400;500;600&display=swap">
-  <link rel="stylesheet" href="styles.css?v=2">
-  <script src="core.js?v=2" defer></script>
-  <script src="app.js?v=2" defer></script>
+  <link rel="stylesheet" href="styles.css?v=3">
+  <script src="core.js?v=3" defer></script>
+  <script src="app.js?v=3" defer></script>
 </head>
 <body>
   <svg xmlns="http://www.w3.org/2000/svg" width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
@@ -77,7 +77,7 @@
           <h1 class="welcome-title">Paste anything and hear it read aloud.</h1>
           <div class="welcome-actions">
             <button class="btn btn-primary btn-lg" id="pastePlayBtn" type="button"><svg class="ic"><use href="#i-play"/></svg>Paste and play</button>
-            <button class="btn btn-lg" id="welcomeOpenBtn" type="button"><svg class="ic"><use href="#i-file"/></svg>Open a file</button>
+            <button class="btn btn-lg" id="welcomeOpenBtn" type="button"><svg class="ic"><use href="#i-file"/></svg>Open a PDF, photo, or file</button>
             <button class="btn btn-lg" id="welcomeNoteBtn" type="button"><svg class="ic"><use href="#i-mic"/></svg>Write or dictate a note</button>
           </div>
           <p class="welcome-note">Texts are saved in this browser on this device.</p>
@@ -115,7 +115,7 @@
     </main>
   </div>
 
-  <input type="file" id="fileInput" accept=".txt,.text,.md,.markdown,.pdf,text/plain,text/markdown,application/pdf" multiple hidden>
+  <input type="file" id="fileInput" accept=".txt,.text,.md,.markdown,.pdf,text/plain,text/markdown,application/pdf,image/*" multiple hidden>
   <input type="file" id="backupInput" accept=".json,application/json" hidden>
 
   <dialog class="sheet" id="speedSheet" aria-labelledby="speedSheetTitle">
@@ -250,6 +250,18 @@
     </section>
 
     <p class="about" id="about"></p>
+  </dialog>
+
+  <dialog class="sheet" id="ocrSheet" aria-labelledby="ocrTitle">
+    <div class="sheet-head">
+      <h2 class="sheet-title" id="ocrTitle">Read the text in the pictures?</h2>
+      <button class="icon-btn" type="button" data-close aria-label="Close"><svg class="ic"><use href="#i-close"/></svg></button>
+    </div>
+    <p class="group-desc"><span id="ocrWhat"></span>, so there’s no text in it yet. Readout can find the words in the pictures, right on this device. The first time, that needs a one-time download of about 5 MB.</p>
+    <div class="field-row">
+      <button class="btn btn-primary" id="ocrYesBtn" type="button">Read the text</button>
+      <button class="btn btn-quiet" type="button" data-close>Cancel</button>
+    </div>
   </dialog>
 
   <div class="toast" id="toast" hidden>
