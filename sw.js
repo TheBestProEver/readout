@@ -1,5 +1,5 @@
 /* Readout service worker: works offline after the first visit. Bump VERSION on each release. */
-const VERSION = 'v3';
+const VERSION = 'v4';
 const SHELL_CACHE = `readout-shell-${VERSION}`;
 const RUNTIME_CACHE = 'readout-runtime';
 const SHELL = [
@@ -46,6 +46,8 @@ self.addEventListener('fetch', (event) => {
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
   if (url.origin === self.location.origin) {
+    // readkit's own pages (lab, demo) have their own service worker and are not the app shell.
+    if (url.pathname.startsWith(new URL('readkit/', self.registration.scope).pathname)) return;
     if (req.mode === 'navigate') event.respondWith(networkFirst(req));
     else event.respondWith(staleWhileRevalidate(req, event));
     return;

@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1d3557">
+<title>readkit lab</title>
+<link rel="icon" href="data:,">
+<style>
+  :root { color-scheme: light dark; --fg: #111; --bg: #f7f7f4; --card: #fff; --line: #ddd; --accent: #1d3557; --good: #1b7f3b; --bad: #b3261e; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #eee; --bg: #15171a; --card: #1f2226; --line: #333; --accent: #8ab4f8; --good: #6dd58c; --bad: #f28b82; } }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; font: 18px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--fg); background: var(--bg); }
+  main { max-width: 640px; margin: 0 auto; padding: 16px 16px 64px; }
+  h1 { font-size: 26px; margin: 8px 0 4px; }
+  h2 { font-size: 21px; margin: 0 0 6px; }
+  p { margin: 6px 0; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px; margin: 16px 0; }
+  button { display: block; width: 100%; min-height: 56px; margin: 10px 0; border: 0; border-radius: 12px; font-family: inherit; font-size: 19px; font-weight: 600; line-height: 1.2; color: #fff; background: var(--accent); cursor: pointer; }
+  @media (prefers-color-scheme: dark) { button { color: #111; } }
+  button.secondary { background: transparent; color: var(--accent); border: 2px solid var(--accent); }
+  button:disabled { opacity: 0.4; }
+  .row { display: flex; gap: 10px; } .row button { flex: 1; }
+  select, input { width: 100%; min-height: 48px; font: inherit; padding: 6px 10px; border-radius: 10px; border: 1px solid var(--line); background: var(--card); color: var(--fg); }
+  label { display: block; margin-top: 10px; font-weight: 600; }
+  progress { width: 100%; height: 18px; }
+  pre { white-space: pre-wrap; word-break: break-word; font: 15px/1.4 ui-monospace, Menlo, Consolas, monospace; margin: 8px 0 0; }
+  .status { font-weight: 600; }
+  .good { color: var(--good); } .bad { color: var(--bad); }
+  .small { font-size: 14px; opacity: 0.75; }
+  textarea { width: 100%; min-height: 220px; font: 14px/1.4 ui-monospace, Menlo, Consolas, monospace; }
+  ol { padding-left: 22px; margin: 6px 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>readkit lab</h1>
+  <p>Tests how well read-aloud works on this phone. Nothing leaves the phone: copy the results at the end and paste them into the chat yourself.</p>
+  <p class="small" id="env">Starting...</p>
+
+  <section class="card">
+    <h2>1. Check this phone</h2>
+    <p>Looks at the graphics chip, audio support, storage and network. Takes a second.</p>
+    <button id="device-go">Check this phone</button>
+    <p class="status" id="device-status"></p>
+    <pre id="device-out"></pre>
+  </section>
+
+  <section class="card">
+    <h2>2. Test the voices</h2>
+    <p><b>Michael</b> is your voice: the most natural one. It needs the phone's graphics chip (WebGPU) and a 330 MB download.</p>
+    <button id="michael-go">Test Michael</button>
+    <div id="michael-ask" hidden>
+      <p>Download 330 MB now? That is large: use Wi-Fi. It is stored on the phone and only downloaded once; if it stops, tap again and it carries on.</p>
+      <div class="row"><button id="michael-yes">Yes, download</button><button id="michael-no" class="secondary">Not now</button></div>
+    </div>
+    <progress id="michael-bar" value="0" max="1" hidden></progress>
+    <p class="status" id="michael-status"></p>
+    <button id="michael-play" class="secondary" disabled hidden>Play sample (Michael)</button>
+    <pre id="michael-out"></pre>
+    <hr>
+    <p><b>Ryan</b> is the backup voice, used when Michael cannot run: works on any phone, 63 MB download.</p>
+    <button id="ryan-go">Test Ryan</button>
+    <div id="ryan-ask" hidden>
+      <p>Download 63 MB now? It is stored on the phone and only downloaded once. If it stops, tap again and it carries on.</p>
+      <div class="row"><button id="ryan-yes">Yes, download</button><button id="ryan-no" class="secondary">Not now</button></div>
+    </div>
+    <progress id="ryan-bar" value="0" max="1" hidden></progress>
+    <p class="status" id="ryan-status"></p>
+    <button id="ryan-play" class="secondary" disabled hidden>Play sample (Ryan)</button>
+    <pre id="ryan-out"></pre>
+  </section>
+
+  <section class="card">
+    <h2>3. Screen-off test</h2>
+    <ol>
+      <li>Press <b>Start</b>. Reading begins.</li>
+      <li>Lock your phone (press the power button).</li>
+      <li>Wait the minutes you chose. Listen if you like.</li>
+      <li>Unlock the phone and come back here.</li>
+    </ol>
+    <label for="off-voice">Voice</label>
+    <select id="off-voice"></select>
+    <label for="off-minutes">Minutes</label>
+    <input id="off-minutes" type="number" min="1" max="120" step="1" value="10" inputmode="numeric">
+    <button id="off-start" disabled>Start</button>
+    <button id="off-stop" class="secondary" disabled>Stop early</button>
+    <p class="status" id="off-status"></p>
+    <p class="small" id="off-live" hidden></p>
+    <pre id="off-out"></pre>
+  </section>
+
+  <section class="card">
+    <h2>4. Share the results</h2>
+    <button id="copy">Copy results</button>
+    <p class="status" id="copy-status"></p>
+    <textarea id="report" readonly hidden></textarea>
+  </section>
+  <audio id="audio"></audio>
+</main>
+<script type="module">
+  // Cross-origin isolation without server headers: sw.js adds COOP/COEP to this page's
+  // responses; the first visit registers it and reloads once so the page is controlled.
+  const KEY = 'readkit-lab-coi-reload';
+  async function isolate() {
+    if (self.crossOriginIsolated) {
+      sessionStorage.removeItem(KEY);
+      return true;
+    }
+    if (!('serviceWorker' in navigator) || !window.isSecureContext) return false;
+    try {
+      await navigator.serviceWorker.register('./sw.js', { scope: './' });
+      await navigator.serviceWorker.ready;
+    } catch (e) {
+      return false;
+    }
+    // Not controlled yet (first visit), or controlled only since the worker claimed this
+    // already-loaded page: reload once so the page itself comes through sw.js.
+    if (!sessionStorage.getItem(KEY)) {
+      sessionStorage.setItem(KEY, '1');
+      location.reload();
+      return null;
+    }
+    return false; // reloaded once and still not isolated (no credentialless support): no threads
+  }
+  const iso = await isolate();
+  if (iso !== null) {
+    const lab = await import('./lab.js');
+    await lab.init();
+    window.labReady = true;
+  }
+</script>
+</body>
+</html>
