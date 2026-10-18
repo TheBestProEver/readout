@@ -55,15 +55,31 @@ export function findChrome() {
   return c.find((p) => p && fs.existsSync(p));
 }
 
-export async function launchChrome() {
+// Always headless (--headless=new) with a fresh temporary profile. opts: { gpu (keep the GPU,
+// for WebGPU), extra: [more flags] }. close() ends Chrome and removes the profile.
+export async function launchChrome(opts = {}) {
   const exe = findChrome();
   if (!exe) throw new Error('Chrome not found. Set CHROME to its path.');
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'readout-e2e-'));
-  const proc = spawn(exe, ['--headless=new', '--remote-debugging-port=0', `--user-data-dir=${dir}`, '--no-first-run', '--no-default-browser-check', '--disable-gpu', '--disable-extensions', 'about:blank'], { stdio: 'ignore' });
+  const args = ['--headless=new', '--remote-debugging-port=0', `--user-data-dir=${dir}`, '--no-first-run', '--no-default-browser-check', ...(opts.gpu ? [] : ['--disable-gpu']), '--disable-extensions', ...(opts.extra || []), 'about:blank'];
+  const proc = spawn(exe, args, { stdio: 'ignore' });
   for (let i = 0; i < 150; i++) {
     try {
       const [port, wsPath] = fs.readFileSync(path.join(dir, 'DevToolsActivePort'), 'utf8').trim().split('\n');
-      return { proc, dir, url: `ws://127.0.0.1:${port}${wsPath}` };
+      const close = async () => {
+        try {
+          proc.kill();
+        } catch (e) {
+          /* already gone */
+        }
+        await sleep(500);
+        try {
+          fs.rmSync(dir, { recursive: true, force: true });
+        } catch (e) {
+          /* Chrome may still hold files for a moment */
+        }
+      };
+      return { proc, dir, url: `ws://127.0.0.1:${port}${wsPath}`, close };
     } catch (e) {
       await sleep(100);
     }
@@ -159,10 +175,12 @@ window.T = {
 true;
 `;
 
-// opts: { config (window.READOUT_CONFIG), phone, context (share a browser profile) }
+// opts: { config (window.READOUT_CONFIG), phone, touch (default: on for phones), context (share a
+// browser profile; 'default' for the browser's own, where another tab can hide this one), init
+// (more script to run in every new document) }
 export async function newDevice(cdp, name, opts) {
-  const browserContextId = opts.context || (await cdp.send('Target.createBrowserContext', { disposeOnDetach: true })).browserContextId;
-  const { targetId } = await cdp.send('Target.createTarget', { url: 'about:blank', browserContextId });
+  const browserContextId = opts.context === 'default' ? undefined : opts.context || (await cdp.send('Target.createBrowserContext', { disposeOnDetach: true })).browserContextId;
+  const { targetId } = await cdp.send('Target.createTarget', browserContextId ? { url: 'about:blank', browserContextId } : { url: 'about:blank' });
   const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
   const s = (m, p) => cdp.send(m, p, sessionId);
   const logs = [];
@@ -178,10 +196,11 @@ export async function newDevice(cdp, name, opts) {
   await s('Runtime.enable');
   await s('Emulation.setFocusEmulationEnabled', { enabled: true });
   await s('Page.addScriptToEvaluateOnNewDocument', { source: `window.READOUT_CONFIG = ${JSON.stringify(opts.config || {})};` });
+  if (opts.init) await s('Page.addScriptToEvaluateOnNewDocument', { source: opts.init });
   if (opts.phone) {
     await s('Emulation.setDeviceMetricsOverride', { width: 360, height: 760, deviceScaleFactor: 3, mobile: true });
     await s('Emulation.setUserAgentOverride', { userAgent: 'Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Mobile Safari/537.36' });
-    await s('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 });
+    if (opts.touch !== false) await s('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 });
   } else {
     await s('Emulation.setDeviceMetricsOverride', { width: 1280, height: 860, deviceScaleFactor: 1, mobile: false });
   }
@@ -189,6 +208,36 @@ export async function newDevice(cdp, name, opts) {
     name,
     logs,
     context: browserContextId,
+    targetId,
+    send: s,
+    // A real click (user activation, which play() needs) in the middle of an element.
+    async click(selector) {
+      // (where it is once it stops moving: sheets slide in)
+      const where = `const e = document.querySelector(${JSON.stringify(selector)}); if (!e) throw new Error('no element ' + ${JSON.stringify(selector)}); e.scrollIntoView({ block: 'center' }); const b = e.getBoundingClientRect(); return { x: b.left + b.width / 2, y: b.top + b.height / 2 };`;
+      let r = await dev.eval(where);
+      for (let k = 0; k < 15; k++) {
+        await sleep(70);
+        const r2 = await dev.eval(where);
+        const still = Math.abs(r2.x - r.x) < 0.5 && Math.abs(r2.y - r.y) < 0.5;
+        r = r2;
+        if (still) break;
+      }
+      for (const type of ['mousePressed', 'mouseReleased']) await s('Input.dispatchMouseEvent', { type, x: r.x, y: r.y, button: 'left', clickCount: 1 });
+    },
+    // Hides this page (the phone's screen going off, as far as the page can tell) by bringing
+    // another tab to the front; focus emulation (which keeps a page visible) is off meanwhile.
+    // Returns a function that shows it again.
+    async hide() {
+      await s('Emulation.setFocusEmulationEnabled', { enabled: false });
+      const other = await cdp.send('Target.createTarget', browserContextId ? { url: 'about:blank', browserContextId } : { url: 'about:blank' });
+      await cdp.send('Target.activateTarget', { targetId: other.targetId });
+      return async () => {
+        await cdp.send('Target.closeTarget', { targetId: other.targetId });
+        await cdp.send('Target.activateTarget', { targetId });
+        await s('Emulation.setFocusEmulationEnabled', { enabled: true });
+        await sleep(300);
+      };
+    },
     async eval(expr) {
       const r = await s('Runtime.evaluate', { expression: `(async () => { ${expr} })()`, awaitPromise: true, returnByValue: true });
       if (r.exceptionDetails) throw new Error(`${name}: ` + ((r.exceptionDetails.exception && r.exceptionDetails.exception.description) || r.exceptionDetails.text));

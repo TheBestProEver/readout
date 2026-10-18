@@ -1,10 +1,12 @@
-// End-to-end test for opening PDFs and photos: text PDFs, scanned PDFs, and pictures
-// read with OCR. Needs Chrome or Edge, and the internet (pdf.js and Tesseract load from jsDelivr).
+// End-to-end test for opening files through readkit's extract(): text PDFs, scanned PDFs and
+// photos (OCR, asked first), Word, PowerPoint, OpenDocument, EPUB, RTF, web pages, Markdown and
+// text. Needs Chrome or Edge, and the internet (pdf.js and Tesseract load from jsDelivr).
 //   node tests/pdf.e2e.mjs
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { checker, connect, launchChrome, newDevice, staticServer } from './browser.mjs';
+import { all as otherFiles } from './fixtures/docs.mjs';
 
 const result = checker();
 const check = result.check;
@@ -53,8 +55,9 @@ function makePdf(pages) {
 const SCAN = [
   ['The lighthouse keeper climbed the stairs', 'every evening before the sun went down.', 'He wiped the glass and lit the lamp,', 'then sat by the window with his tea.'],
   ['Ships passed in the dark, far from shore.', 'None of them knew his name, but all', 'of them trusted the light he kept.'],
-  ['Winter brought storms that shook the tower.', 'Still the lamp burned through the night.'],
-  ['In spring a letter came from the mainland.', 'It thanked him for forty quiet years.'],
+  // (readkit skips a scanned page with only a line or two of print as blank: notes/v2.md)
+  ['Winter brought storms that shook the tower.', 'Still the lamp burned through the night.', 'The keeper wrote the weather in his book', 'and slept an hour before the dawn came.'],
+  ['In spring a letter came from the mainland.', 'It thanked him for forty quiet years.', 'He read it twice beside the window', 'and kept it in the drawer with the others.'],
 ];
 
 async function main() {
@@ -118,6 +121,16 @@ async function main() {
     check(/books you sent/.test(tl) && /Warm wishes/.test(tl), 'opens with its text');
     check(!(await phone.eval(`return T.$('ocrSheet').open`)), 'and a blank page doesn’t make it look scanned');
 
+    console.log('Other kinds of files');
+    for (const [name, type, bytes, want, never] of otherFiles()) {
+      await open(bytes, name, type);
+      const title = name.replace(/\.[^.]+$/, '');
+      const t = await waitDoc(title, 60000).catch((e) => '');
+      const flat = t.replace(/\s+/g, ' ');
+      check(want.every((w) => flat.includes(w)) && !never.some((w) => flat.includes(w)), `${name}: its text is read, and nothing else`, flat.slice(0, 300));
+    }
+    check(!(await phone.eval(`return T.$('ocrSheet').open`)), 'none of them asks about pictures');
+
     console.log('A scanned PDF, first time');
     const scan = makePdf([await scanPage(SCAN[0]), await scanPage(SCAN[1])]);
     await open(scan, 'Lighthouse scan.pdf');
@@ -145,12 +158,15 @@ async function main() {
     console.log('Stopping part way');
     const four = makePdf(await Promise.all(SCAN.map((l) => scanPage(l))));
     await open(four, 'Four pages.pdf');
-    await phone.eval(`await T.wait(() => /page 1 of 4/.test(T.toast()), 60000, 'page 1'); T.$('toastAction').click();`);
+    await phone.eval(`await T.wait(() => /page 1 of 4/.test(T.toast()), 60000, 'page 1');`);
+    check(true, 'shows which page it is reading, with a Stop button');
+    await phone.eval(`await T.wait(() => /page 3 of 4/.test(T.toast()), 120000, 'page 3'); T.$('toastAction').click();`);
     const t4 = await waitDoc('Four pages', 120000);
     check(/lighthouse/i.test(t4) && !/mainland/i.test(t4), 'Stop keeps the pages read so far', t4);
+    check(/Stopped/.test(await phone.eval('return T.toast()')), 'and says it stopped', await phone.eval('return T.toast()'));
 
     console.log('When the text reader can’t be downloaded');
-    const broken = await newDevice(cdp, 'offline phone', { phone: true, config: { ocrLangPath: appUrl + 'no-such-folder', ocrStall: 15000 } });
+    const broken = await newDevice(cdp, 'offline phone', { phone: true, config: { readkit: { tesseract: { lang: appUrl + 'no-such-folder' } } } });
     await broken.goto(appUrl);
     const openOn = (dev, buf, name) => dev.eval(`
       const bytes = Uint8Array.from(atob(${JSON.stringify(buf.toString('base64'))}), (c) => c.charCodeAt(0));
@@ -166,11 +182,11 @@ async function main() {
     ]);
     await openOn(broken, mixed, 'Mixed.pdf');
     await broken.eval(`await T.wait(() => T.$('ocrSheet').open, 30000, 'the question'); T.$('ocrYesBtn').click();`);
-    const tm = await broken.eval(`await T.wait(() => T.R().state.docs.find((d) => d.title === 'Mixed'), 60000, 'the doc'); return T.R().state.docs.find((d) => d.title === 'Mixed').text;`);
+    const tm = await broken.eval(`await T.wait(() => T.R().state.docs.find((d) => d.title === 'Mixed'), 180000, 'the doc'); return T.R().state.docs.find((d) => d.title === 'Mixed').text;`);
     check(/about the harbor/.test(tm) && /about the tide/.test(tm), 'a PDF with typed pages still opens with their text');
     check(/Couldn’t read the pictures/.test(await broken.eval('return T.toast()')), 'and says the pictures couldn’t be read', await broken.eval('return T.toast()'));
     await openOn(broken, scan, 'Only pictures.pdf');
-    await broken.eval(`await T.wait(() => /Couldn’t open/.test(T.toast()), 60000, 'an error message');`);
+    await broken.eval(`await T.wait(() => /Couldn’t read the pictures in “Only pictures.pdf”|Couldn’t open/.test(T.toast()), 180000, 'an error message');`);
     check(!(await broken.eval(`return T.R().state.docs.some((d) => d.title === 'Only pictures')`)), 'a scan that can’t be read shows a message instead of hanging');
     check(!(await broken.eval(`return /Getting ready/.test(T.toast())`)), 'and the “getting ready” message is gone');
 
@@ -197,7 +213,7 @@ async function main() {
     }
   } finally {
     cdp.close();
-    chrome.proc.kill();
+    await chrome.close();
     app.close();
   }
   console.log(`\n${result.checks - result.failures}/${result.checks} PDF and photo checks passed`);

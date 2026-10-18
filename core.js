@@ -9,12 +9,6 @@
 })(typeof self !== 'undefined' ? self : this, function () {
   'use strict';
 
-  // Each utterance stays short. Chrome's online voices cut out after ~15 s of
-  // continuous speech, and Android's speech engine has a per-utterance length cap.
-  const MAX_CHUNK = 200;
-  const LETTER = /[\p{L}\p{N}]/u;
-  const HAS_SEGMENTER = typeof Intl !== 'undefined' && typeof Intl.Segmenter === 'function';
-
   /* ---------- input cleanup ---------- */
 
   function normalizeText(text) {
@@ -54,21 +48,6 @@
     return soft;
   }
 
-  // Same length as the input: soft newlines become spaces so a sentence that
-  // wraps across lines is still read as one sentence.
-  function maskSoftBreaks(text) {
-    const soft = softNewlines(text, false);
-    if (!soft.length) return text;
-    const parts = [];
-    let last = 0;
-    for (const i of soft) {
-      parts.push(text.slice(last, i), ' ');
-      last = i + 1;
-    }
-    parts.push(text.slice(last));
-    return parts.join('');
-  }
-
   // Rewrites hard-wrapped text (PDFs, emails) into flowing paragraphs.
   function reflow(text, opts) {
     const aggressive = !opts || opts.aggressive !== false;
@@ -88,219 +67,115 @@
       .trim();
   }
 
-  /* ---------- PDF pages ---------- */
+  /* ---------- speech segments (from readkit's plan()) ---------- */
 
-  function letterCount(text) {
-    const m = String(text || '').match(/\p{L}/gu);
-    return m ? m.length : 0;
-  }
+  // A segment is { start, end, spoken, kind, pauseAfterMs, align } where start/end index the
+  // stored text and align lists [spokenStart, spokenEnd, srcStart, srcEnd] per spoken word.
 
-  const PAGE_NUMBER = /^(?:[Pp]age\s+|PAGE\s+)?[-–—([]?\s*(?:\d{1,3}|(?=[ivxlc])c{0,3}(?:xc|xl|l?x{0,3})(?:ix|iv|v?i{0,3})|(?=[IVXLC])C{0,3}(?:XC|XL|L?X{0,3})(?:IX|IV|V?I{0,3}))\s*[-–—)\]]?(?:\s*(?:of|OF|\/)\s*\d{1,4})?$/;
-
-  // Removes running headers, footers, and page numbers, so they aren't read out on
-  // every page: short lines near the top or bottom of a page that are page numbers,
-  // or that repeat (numbers aside) on many pages.
-  function stripRepeats(pages) {
-    // Running heads differ only by the page number at their start or end.
-    const shape = (line) => line.toLowerCase().replace(/\s+/g, ' ').trim().replace(/^\d+\s*|\s*\d+$/g, '#');
-    const split = pages.map((p) => String(p || '').split('\n'));
-    const edges = split.map((lines) => {
-      const filled = [];
-      lines.forEach((l, i) => l.trim() && filled.push(i));
-      const edge = filled.length > 8 ? 3 : 1; // on a short page, only its first and last line
-      return new Set(filled.slice(0, edge).concat(filled.slice(-edge)));
-    });
-    const counts = new Map();
-    split.forEach((lines, p) => {
-      const seen = new Set();
-      for (const i of edges[p]) {
-        const k = shape(lines[i]);
-        if (k.length > 80 || seen.has(k)) continue;
-        seen.add(k);
-        counts.set(k, (counts.get(k) || 0) + 1);
-      }
-    });
-    const need = Math.max(3, Math.ceil(pages.length * 0.4));
-    return split.map((lines, p) =>
-      lines
-        .filter((l, i) => {
-          if (!edges[p].has(i)) return true;
-          const k = shape(l);
-          if (PAGE_NUMBER.test(l.trim())) return false;
-          return !(pages.length >= 3 && k.length <= 80 && counts.get(k) >= need);
-        })
-        .join('\n')
-    );
-  }
-
-  // Text read from pictures picks up stray marks from borders, smudges, and
-  // figures; this drops lines that are mostly symbols (dates and numbers stay).
-  function cleanOcr(text) {
-    return String(text || '')
-      .split('\n')
-      .filter((l) => {
-        const t = l.replace(/\s/g, '');
-        if (!t) return true;
-        const m = t.match(/[\p{L}\p{N}]/gu);
-        const n = m ? m.length : 0;
-        return n >= 2 && n / t.length >= 0.5;
-      })
-      .join('\n')
-      .replace(/\n{3,}/g, '\n\n')
-      .trim();
-  }
-
-  /* ---------- sentence chunking ---------- */
-
-  const segmenters = new Map();
-  function getSegmenter(lang) {
-    const key = lang || '';
-    if (!segmenters.has(key)) {
-      let seg;
-      try {
-        seg = new Intl.Segmenter(lang || undefined, { granularity: 'sentence' });
-      } catch (e) {
-        seg = new Intl.Segmenter(undefined, { granularity: 'sentence' });
-      }
-      segmenters.set(key, seg);
-    }
-    return segmenters.get(key);
-  }
-
-  function splitSentences(str, lang) {
-    const out = [];
-    if (HAS_SEGMENTER) {
-      for (const s of getSegmenter(lang).segment(str)) {
-        out.push({ start: s.index, end: s.index + s.segment.length });
-      }
-      return out;
-    }
-    const re = /[^.!?…]+(?:[.!?…]+["'”’)\]]*\s*|$)/g;
-    let m;
-    while ((m = re.exec(str))) {
-      if (!m[0]) {
-        re.lastIndex++;
-        continue;
-      }
-      out.push({ start: m.index, end: m.index + m[0].length });
-    }
-    return out;
-  }
-
-  // Sentence ends that are probably abbreviations or initials, not real ends.
-  const ABBREV = /(?:^|[\s(])(?:mr|mrs|ms|dr|prof|sr|jr|st|mt|vs|etc|e\.g|i\.e|cf|al|fig|figs|eq|eqs|no|vol|ch|sec|pp?|ed|eds|approx|dept|est|inc|ltd|co|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec|\p{L})\.$/iu;
-
-  function isBlank(ch) {
-    return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\f' || ch === '\v';
-  }
-
-  function pushIfSpeakable(chunks, seg, a, b) {
-    while (a < b && isBlank(seg[a])) a++;
-    while (b > a && isBlank(seg[b - 1])) b--;
-    if (b > a && LETTER.test(seg.slice(a, b))) chunks.push({ start: a, end: b });
-  }
-
-  function splitLong(seg, a, b, max, chunks) {
-    while (b - a > max) {
-      const win = seg.slice(a, a + max);
-      let cut = -1;
-      const re = /[,;:—–)\]](?=\s)|\s[—–-]\s/g;
-      let m;
-      while ((m = re.exec(win))) {
-        const pos = m.index + m[0].length;
-        if (pos >= max * 0.4) cut = pos;
-      }
-      if (cut === -1) {
-        const sp = win.lastIndexOf(' ');
-        if (sp >= max * 0.4) cut = sp;
-      }
-      if (cut === -1) cut = max;
-      pushIfSpeakable(chunks, seg, a, a + cut);
-      a += cut;
-      while (a < b && isBlank(seg[a])) a++;
-    }
-    pushIfSpeakable(chunks, seg, a, b);
-  }
-
-  function chunkBlock(seg, bs, be, chunks, max, lang) {
-    const pieces = [];
-    for (const s of splitSentences(seg.slice(bs, be), lang)) {
-      let a = bs + s.start;
-      let b = bs + s.end;
-      while (a < b && isBlank(seg[a])) a++;
-      while (b > a && isBlank(seg[b - 1])) b--;
-      if (b > a && LETTER.test(seg.slice(a, b))) pieces.push([a, b]);
-    }
-    for (let i = 0; i < pieces.length; i++) {
-      const a = pieces[i][0];
-      let b = pieces[i][1];
-      while (i + 1 < pieces.length && ABBREV.test(seg.slice(a, b)) && pieces[i + 1][1] - a <= max * 1.5) {
-        b = pieces[i + 1][1];
-        i++;
-      }
-      splitLong(seg, a, b, max, chunks);
-    }
-  }
-
-  // Splits text into speakable chunks. Offsets index into the original text.
-  function chunkText(text, opts) {
-    const max = (opts && opts.max) || MAX_CHUNK;
-    const lang = opts && opts.lang;
-    const chunks = [];
-    if (!text) return chunks;
-    const seg = maskSoftBreaks(text);
-    let start = 0;
-    while (start <= seg.length) {
-      let nl = seg.indexOf('\n', start);
-      if (nl === -1) nl = seg.length;
-      if (nl > start) chunkBlock(seg, start, nl, chunks, max, lang);
-      if (nl >= seg.length) break;
-      start = nl + 1;
-    }
-    return chunks;
-  }
-
-  // cum[i] = characters before chunk i; cum[n] = total characters.
-  function prefixLengths(chunks) {
-    const cum = new Array(chunks.length + 1);
+  // cum[i] = characters before segment i; cum[n] = total characters.
+  function prefixLengths(segs) {
+    const cum = new Array(segs.length + 1);
     cum[0] = 0;
-    for (let i = 0; i < chunks.length; i++) cum[i + 1] = cum[i] + (chunks[i].end - chunks[i].start);
+    for (let i = 0; i < segs.length; i++) cum[i + 1] = cum[i] + (segs[i].end - segs[i].start);
     return cum;
   }
 
-  // Index of the chunk that contains (or follows) a character offset.
-  function findChunkIndex(chunks, offset) {
-    if (!chunks.length) return 0;
+  // Index of the segment that contains (or follows) a character offset.
+  function findSegment(segs, offset) {
+    if (!segs.length) return 0;
     let lo = 0;
-    let hi = chunks.length - 1;
-    if (offset <= chunks[0].start) return 0;
-    if (offset >= chunks[hi].end) return hi;
+    let hi = segs.length - 1;
+    if (offset <= segs[0].start) return 0;
+    if (offset >= segs[hi].end) return hi;
     while (lo < hi) {
       const mid = (lo + hi) >> 1;
-      if (chunks[mid].end <= offset) lo = mid + 1;
+      if (segs[mid].end <= offset) lo = mid + 1;
       else hi = mid;
     }
     return lo;
   }
 
-  /* ---------- text sent to the speech engine ---------- */
-
-  const URL_RE = /\b(?:https?:\/\/|www\.)[^\s<>"'”’)\]]+/gi;
-
-  function spaces(n) {
-    return n > 0 ? ' '.repeat(n) : '';
+  // The align entry holding a spoken-text index (-1 when it falls between words).
+  function alignAtSpoken(seg, i) {
+    const a = (seg && seg.align) || [];
+    for (let k = 0; k < a.length; k++) if (i >= a[k][0] && i < a[k][1]) return k;
+    return -1;
   }
 
-  // Strips symbols that speech engines read aloud badly. Output length always
-  // equals input length, so word-boundary positions still line up with the text.
-  function speakable(str) {
-    let s = String(str);
-    s = s.replace(URL_RE, (m) => (m.length >= 4 ? 'link' + spaces(m.length - 4) : spaces(m.length)));
-    s = s.replace(/^[ \t]*>+/gm, (m) => spaces(m.length));
-    s = s.replace(/([-=_~])\1{2,}/g, (m) => spaces(m.length));
-    s = s.replace(/\.{4,}/g, (m) => spaces(m.length));
-    s = s.replace(/[*_`~#|•▪◦►▶■□●]+/g, (m) => spaces(m.length));
-    return s;
+  // Where to start speaking a segment to resume at a source offset inside it (relative to
+  // seg.start): the first spoken word whose source starts at or after that offset.
+  function spokenStartFor(seg, within) {
+    const a = (seg && seg.align) || [];
+    if (!(within > 0) || !a.length) return 0;
+    const at = seg.start + within;
+    for (let k = 0; k < a.length; k++) if (a[k][3] > at) return a[k][0];
+    return 0;
+  }
+
+  // Source range of a word (align index) relative to the segment start: [from, length].
+  function wordRange(seg, k) {
+    const a = seg && seg.align && seg.align[k];
+    if (!a) return null;
+    const from = Math.max(0, a[2] - seg.start);
+    return [from, Math.max(1, Math.min(seg.end, a[3]) - Math.max(seg.start, a[2]))];
+  }
+
+  // Headings to jump to: [{ index, title, level }] from heading segments.
+  function headingsOf(segs, text) {
+    const out = [];
+    for (let i = 0; i < segs.length; i++) {
+      const s = segs[i];
+      if (s.kind !== 'heading') continue;
+      const t = String(text || '');
+      const raw = t.slice(s.start, s.end);
+      // plan() starts a Markdown heading after its '#' marks
+      const line = t.slice(t.lastIndexOf('\n', s.start - 1) + 1, s.start) + raw;
+      const m = /^\s*(#{1,6})\s/.exec(line);
+      let title = raw.replace(/^[\s#>*\-•]+/, '').replace(/\s+/g, ' ').trim();
+      if (!title) title = String(s.spoken || '').trim();
+      if (title.length > 80) title = title.slice(0, 79).replace(/\s+\S*$/, '') + '…';
+      if (title) out.push({ index: i, title, level: m ? m[1].length : 1 });
+    }
+    return out;
+  }
+
+  /* ---------- pronunciations (passed to plan() as its lexicon) ---------- */
+
+  const LEX_MAX = 500;
+
+  // [[word, sayAs], ...]: trimmed, one entry per word (the last one wins), sorted by word.
+  function cleanLexicon(list) {
+    const map = new Map();
+    const src = Array.isArray(list) ? list : list && typeof list === 'object' ? Object.entries(list) : [];
+    for (const e of src) {
+      const word = String((Array.isArray(e) ? e[0] : e && e.word) || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+      const say = String((Array.isArray(e) ? e[1] : e && e.say) || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+      if (!word || !say || !/[\p{L}\p{N}]/u.test(word)) continue;
+      map.set(word.toLowerCase(), [word, say]);
+    }
+    return [...map.values()].sort((a, b) => (a[0].toLowerCase() < b[0].toLowerCase() ? -1 : 1)).slice(0, LEX_MAX);
+  }
+
+  function lexiconMap(list) {
+    const out = {};
+    for (const [w, s] of cleanLexicon(list)) out[w] = s;
+    return out;
+  }
+
+  /* ---------- reading queue, sleep timer ---------- */
+
+  // The next text to read after `id` in a fixed library order, skipping finished ones.
+  function nextInOrder(order, id, isDone) {
+    const i = order.indexOf(id);
+    if (i < 0) return null;
+    for (let k = i + 1; k < order.length; k++) if (!isDone || !isDone(order[k])) return order[k];
+    return null;
+  }
+
+  // Volume during the sleep timer's fade-out: 1 until the last fadeMs, then down to 0.
+  function fadeGain(msLeft, fadeMs) {
+    if (!(fadeMs > 0)) return msLeft > 0 ? 1 : 0;
+    return clamp(msLeft / fadeMs, 0, 1);
   }
 
   /* ---------- titles, counts, formatting ---------- */
@@ -441,13 +316,30 @@
   /* ---------- sync ---------- */
 
   // The synced library lives in a few files: one index (reading positions and
-  // deletions) and up to 16 shards of texts, so a gist never needs more than 17 files.
+  // deletions), up to 16 shards of texts and one file of preferences (the pronunciation
+  // list), so a gist never needs more than 18 files. Versions before 2.0 ignore the
+  // preferences file and never delete it.
   const SYNC_SCHEMA = 1;
   const SYNC_INDEX = 'readout-index.json';
+  const SYNC_PREFS = 'readout-prefs.json';
   const SYNC_SHARD = /^readout-docs-[0-9a-f]\.json$/;
 
   function isSyncFile(name) {
-    return name === SYNC_INDEX || SYNC_SHARD.test(name);
+    return name === SYNC_INDEX || name === SYNC_PREFS || SYNC_SHARD.test(name);
+  }
+
+  // Synced preferences: { lexicon: [[word, sayAs], ...], at }. The newer list wins whole
+  // (a list edited on two devices at once keeps the later edit).
+  function syncPrefs(p) {
+    if (!p || typeof p !== 'object' || !(Number(p.at) > 0)) return null;
+    return { lexicon: cleanLexicon(p.lexicon), at: Number(p.at) };
+  }
+
+  function mergePrefs(a, b) {
+    const x = syncPrefs(a);
+    const y = syncPrefs(b);
+    if (!x || !y) return x || y;
+    return wins(x, y, (p) => p.at) ? x : y;
   }
 
   function hash32(str) {
@@ -577,8 +469,8 @@
    *   latest change, and if both changed its text, the newer text wins and the
    *   other is kept as a copy;
    * - a deletion removes only the versions the deleting device had seen.
-   * local/remote: { docs, positions, tombs: { id: { at, vv } } }
-   * Returns { docs, positions, tombs, copies } with docs/positions sorted by id.
+   * local/remote: { docs, positions, tombs: { id: { at, vv } }, prefs: { lexicon, at } }
+   * Returns { docs, positions, tombs, prefs, copies } with docs/positions sorted by id.
    */
   function mergeSync(local, remote, opts) {
     const o = opts || {};
@@ -669,6 +561,7 @@
       docs: [...docs.values()].sort(byId),
       positions: [...positions.values()].sort(byId),
       tombs: Object.fromEntries([...tombs.keys()].sort().map((id) => [id, tombs.get(id)])),
+      prefs: mergePrefs(local && local.prefs, remote && remote.prefs),
       copies,
     };
   }
@@ -677,6 +570,8 @@
   function buildSyncFiles(m) {
     const files = {};
     files[SYNC_INDEX] = JSON.stringify({ app: 'readout', schema: SYNC_SCHEMA, positions: m.positions || [], tombs: m.tombs || {} });
+    const prefs = syncPrefs(m.prefs);
+    if (prefs) files[SYNC_PREFS] = JSON.stringify({ app: 'readout', schema: SYNC_SCHEMA, lexicon: prefs.lexicon, at: prefs.at });
     const shards = new Map();
     for (const d of m.docs || []) {
       const name = shardName(d.id);
@@ -689,10 +584,10 @@
     return files;
   }
 
-  // Reads gist files back into { docs, positions, tombs }. `newer` means another
+  // Reads gist files back into { docs, positions, tombs, prefs }. `newer` means another
   // device wrote a format this version doesn't know, and `bad` lists unreadable files.
   function parseSyncFiles(files) {
-    const out = { docs: [], positions: [], tombs: {}, newer: false, bad: [] };
+    const out = { docs: [], positions: [], tombs: {}, prefs: null, newer: false, bad: [] };
     for (const name of Object.keys(files || {}).sort()) {
       if (!isSyncFile(name)) continue;
       let data = null;
@@ -709,6 +604,8 @@
       if (name === SYNC_INDEX) {
         if (Array.isArray(data.positions)) out.positions = data.positions;
         if (data.tombs && typeof data.tombs === 'object') out.tombs = data.tombs;
+      } else if (name === SYNC_PREFS) {
+        out.prefs = syncPrefs(data);
       } else if (Array.isArray(data.docs)) {
         for (const d of data.docs) out.docs.push(d);
       }
@@ -759,19 +656,19 @@
   }
 
   return {
-    MAX_CHUNK,
     normalizeText,
     isSoftBreak,
-    maskSoftBreaks,
     reflow,
-    letterCount,
-    stripRepeats,
-    cleanOcr,
-    splitSentences,
-    chunkText,
     prefixLengths,
-    findChunkIndex,
-    speakable,
+    findSegment,
+    alignAtSpoken,
+    spokenStartFor,
+    wordRange,
+    headingsOf,
+    cleanLexicon,
+    lexiconMap,
+    nextInOrder,
+    fadeGain,
     deriveTitle,
     wordCount,
     formatDuration,
@@ -783,7 +680,9 @@
     docStamp,
     mergeDocs,
     SYNC_INDEX,
+    SYNC_PREFS,
     isSyncFile,
+    mergePrefs,
     shardName,
     compareVV,
     maxVV,

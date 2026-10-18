@@ -1,24 +1,20 @@
-/* Readout: paste text and hear it read aloud, or dictate notes. No build step, no dependencies. */
+/* Readout: paste text or open a file and hear it read aloud, or dictate notes. No build step.
+ * Text and speech come from readkit (vendored in readkit/, loaded with import()): extract()
+ * turns any file into text, plan() turns text into what a voice says, and its voices and
+ * player read it aloud, with the screen off too. */
 (() => {
   'use strict';
 
   const Core = window.ReadoutCore;
-  const VERSION = '1.2.0';
+  const VERSION = '2.0.0';
   const CONFIG = Object.assign(
     {
-      pdfjsBase: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@5.6.205/legacy/build/', // the build that also runs on older Chrome
-      pdfjsWasm: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@5.6.205/wasm/',
-      // Reading text in scanned pages and photos (Tesseract), loaded on first use
-      ocrScript: 'https://cdn.jsdelivr.net/npm/tesseract.js@7.0.0/dist/tesseract.min.js',
-      ocrWorker: 'https://cdn.jsdelivr.net/npm/tesseract.js@7.0.0/dist/worker.min.js',
-      ocrCore: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@7.0.0',
-      ocrLang: 'eng',
-      ocrLangPath: 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/eng/4.0.0_best_int',
-      ocrStall: 60000, // ms without progress before giving up on getting OCR ready
       githubApi: 'https://api.github.com',
       netWait: 45000, // ms to wait for a reply to start
       netStall: 30000, // ms a reply may pause before giving up
       fastEndCheck: true,
+      readkit: null, // configure() overrides for readkit (tests, self-hosting)
+      swOnLocalhost: false,
     },
     window.READOUT_CONFIG || {}
   );
@@ -30,16 +26,24 @@
   const darkScheme = mq('(prefers-color-scheme: dark)');
   const desktop = mq('(min-width: 960px)');
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition || null;
+  const LOOPBACK = /^(?:localhost|127\.\d+\.\d+\.\d+|\[::1\])$/;
 
   const DEFAULTS = {
     rate: 1,
     pitch: 1,
-    voiceURI: '',
+    voiceURI: '', // device voice
+    voiceMode: 'natural', // 'natural' (Kokoro) | 'standard' (Piper) | 'device' (speechSynthesis)
+    accent: '', // 'en-US' | 'en-GB'; '' = from the device's language
+    voices: {}, // chosen speaker per mode and accent: { 'natural-en-US': 'am_michael', ... }
     theme: 'system',
     size: 'm',
     follow: true,
     keepAwake: true,
-    background: false,
+    autoNext: false,
+    skipCitations: true,
+    includeNotes: false,
+    lexicon: [], // [[word, sayAs], ...]
+    lexiconAt: 0,
     dictLang: '',
     spokenPunct: true,
     dictLocal: false,
@@ -47,9 +51,19 @@
     lastDocId: null,
     seenWelcome: false,
     ocrOk: false, // agreed to the one-time download for reading scanned pages
+    offeredVoice: false, // the one-time "get a natural voice" hint was shown
   };
 
   const RATE_PRESETS = [0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3];
+  const MAX_RATE = { device: 4, audio: 3 };
+
+  // The voices offered per mode and accent, default first (readkit's catalog ids).
+  const KIT_VOICES = {
+    'natural-en-US': ['am_michael', 'am_fenrir', 'am_puck', 'af_heart', 'af_bella'],
+    'natural-en-GB': ['bm_george', 'bf_emma'],
+    'standard-en-US': ['en_US-ryan-medium'],
+    'standard-en-GB': ['en_GB-alba-medium', 'en_GB-cori-medium'],
+  };
 
   const DICT_LANGS = [
     ['', 'Same as this device'],
@@ -96,7 +110,7 @@
     docs: [],
     positions: new Map(),
     current: null,
-    chunks: [],
+    segs: [], // readkit plan() segments of the current text
     cum: [0],
     idx: 0,
     dirty: false,
@@ -110,6 +124,79 @@
   let curSpan = -1;
   let lastManualScroll = 0;
   let scrubbing = false;
+
+  /* ================= readkit ================= */
+
+  // The text side (extract, plan) loads at start; voices and the player load when needed.
+  const kit = { K: null, system: null, autoName: null, V: null, P: null };
+
+  // Dev override (never on by default): ?local=<http://127.0.0.1:port> points the voice models
+  // and their runtime at a local server (the layout of readkit's tests/fixtures/voice/server.mjs).
+  // Only honoured when both Readout and that server are on this machine.
+  function localModels() {
+    const v = new URLSearchParams(location.search).get('local');
+    if (!v) return null;
+    try {
+      const u = new URL(v);
+      if (!LOOPBACK.test(u.hostname) || !LOOPBACK.test(location.hostname) || !/^https?:$/.test(u.protocol)) return null;
+      const b = u.origin;
+      return { ort: b + '/ort/', phonemizer: b + '/phonemizer.js', piperPhonemize: b + '/piperph/', kokoro: { base: b + '/kokoro/' }, piper: b + '/piper/' };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async function loadKit() {
+    const [K, system, ex] = await Promise.all([import('./readkit/index.js'), import('./readkit/src/voice/system.js'), import('./readkit/src/extract.js')]);
+    if (CONFIG.readkit) K.configure(CONFIG.readkit);
+    const local = localModels();
+    if (local) K.configure(local);
+    kit.K = K;
+    kit.system = system;
+    kit.autoName = ex.autoName;
+  }
+
+  function voiceModule() {
+    if (!kit.Vp) kit.Vp = import('./readkit/src/voice/voice.js').then((m) => (kit.V = m)).catch((e) => ((kit.Vp = null), Promise.reject(e)));
+    return kit.Vp;
+  }
+
+  function playerModule() {
+    if (!kit.Pp) kit.Pp = import('./readkit/src/audio/player.js').then((m) => (kit.P = m)).catch((e) => ((kit.Pp = null), Promise.reject(e)));
+    return kit.Pp;
+  }
+
+  function accent() {
+    const a = state.settings.accent;
+    if (a === 'en-US' || a === 'en-GB') return a;
+    return /^en-(GB|IE|AU|NZ|IN|ZA)/i.test(navigator.language || '') ? 'en-GB' : 'en-US';
+  }
+
+  let lexCache = { at: -1, map: null };
+  function planOptions() {
+    const s = state.settings;
+    if (lexCache.at !== s.lexiconAt || !lexCache.map) lexCache = { at: s.lexiconAt, map: Core.lexiconMap(s.lexicon) };
+    const opts = { dialect: accent(), skip: { citations: s.skipCitations !== false } };
+    if (Object.keys(lexCache.map).length) opts.lexicon = lexCache.map;
+    return opts;
+  }
+
+  // Text -> segments. plan() never throws on real text; if it ever does, each line is read as it is.
+  function planText(text) {
+    if (!text || !/[\p{L}\p{N}]/u.test(text)) return [];
+    try {
+      return kit.K.plan(text, planOptions());
+    } catch (e) {
+      console.warn('Readout: plan() failed, reading line by line', e);
+      const out = [];
+      const re = /[^\n]+/g;
+      let m;
+      while ((m = re.exec(text))) {
+        if (/[\p{L}\p{N}]/u.test(m[0])) out.push({ index: out.length, start: m.index, end: m.index + m[0].length, spoken: m[0].trim(), kind: 'sentence', pauseAfterMs: 0, align: [] });
+      }
+      return out;
+    }
+  }
 
   /* ================= storage ================= */
 
@@ -252,16 +339,18 @@
       /* ignore */
     }
   }
+  // A place is saved per segment ({ id, offset, progress, done, at }, the 1.x format sync
+  // uses): the segment's first character, or the word where the device voice was paused.
   function savePositionNow(finishedNow) {
     clearTimeout(posTimer);
     posTimer = null;
     const doc = state.current;
     if (!doc) return;
-    const n = state.chunks.length;
+    const n = state.segs.length;
     const finished = finishedNow === true || (n > 0 && state.idx >= n);
     const i = Math.min(state.idx, Math.max(0, n - 1));
-    const ch = state.chunks[i];
-    const offset = finished ? doc.text.length : ch ? ch.start + (tts.playing ? 0 : tts.wordOffset || 0) : 0;
+    const sg = state.segs[i];
+    const offset = finished ? doc.text.length : sg ? sg.start + (tts.playing ? 0 : tts.wordOffset || 0) : 0;
     const progress = n ? (finished ? 1 : state.cum[i] / state.cum[n]) : 0;
     const old = state.positions.get(doc.id);
     if (old && old.offset === offset && !!old.done === finished) {
@@ -376,7 +465,7 @@
     const o = opts || {};
     const doc = state.docs.find((d) => d.id === id);
     if (!doc) return;
-    pausePlayback();
+    if (!o.keepPlaying) pausePlayback();
     stopDictation();
     flushDocs();
     const prev = state.current;
@@ -384,7 +473,7 @@
     state.current = doc;
     state.settings.lastDocId = doc.id;
     saveSettings();
-    rebuildChunks();
+    rebuildSegments();
     placeAtSaved(doc);
     state.mode = o.mode || (doc.text.trim() ? 'listen' : 'edit');
     if (state.mode === 'edit') el.editor.value = doc.text;
@@ -396,6 +485,7 @@
     }
     renderLibrary();
     updateMediaSession();
+    if (state.mode === 'listen') warmVoiceSoon();
   }
 
   // Moves the reading place to where this doc was left off.
@@ -403,11 +493,11 @@
     const pos = state.positions.get(doc.id);
     tts.wordOffset = 0;
     if (pos && pos.done) {
-      state.idx = state.chunks.length;
-    } else if (pos && state.chunks.length) {
-      state.idx = Core.findChunkIndex(state.chunks, pos.offset);
-      const ch = state.chunks[state.idx];
-      if (ch && pos.offset > ch.start && pos.offset < ch.end) tts.wordOffset = pos.offset - ch.start;
+      state.idx = state.segs.length;
+    } else if (pos && state.segs.length) {
+      state.idx = Core.findSegment(state.segs, pos.offset);
+      const sg = state.segs[state.idx];
+      if (sg && pos.offset > sg.start && pos.offset < sg.end) tts.wordOffset = pos.offset - sg.start;
     } else {
       state.idx = 0;
     }
@@ -416,8 +506,9 @@
   function showWelcome() {
     pausePlayback();
     stopDictation();
+    dropPlayer();
     state.current = null;
-    state.chunks = [];
+    state.segs = [];
     state.cum = [0];
     state.idx = 0;
     state.mode = 'listen';
@@ -479,22 +570,39 @@
 
   function applyDocText(doc, text) {
     pausePlayback();
-    const ch = state.chunks[Math.min(state.idx, state.chunks.length - 1)];
-    const ratio = ch && doc.text.length ? ch.start / doc.text.length : 0;
+    const sg = state.segs[Math.min(state.idx, state.segs.length - 1)];
+    const ratio = sg && doc.text.length ? sg.start / doc.text.length : 0;
     doc.text = text;
     doc.updatedAt = Date.now();
     if (!doc.titleLocked) doc.title = Core.deriveTitle(text);
     touch(doc, true);
     scheduleSave(doc);
     if (state.current === doc) {
-      rebuildChunks();
-      state.idx = Core.findChunkIndex(state.chunks, Math.round(ratio * text.length));
+      rebuildSegments();
+      state.idx = Core.findSegment(state.segs, Math.round(ratio * text.length));
       tts.wordOffset = 0;
       if (state.mode === 'edit') el.editor.value = text;
       renderView();
       renderReader();
     }
     renderLibrarySoon();
+  }
+
+  // The reading settings changed (accent, pronunciations, citations): plan the text again
+  // and carry on from the same place.
+  function replanCurrent() {
+    const doc = state.current;
+    if (!doc) return;
+    const wasPlaying = tts.playing;
+    pausePlayback();
+    const sg = state.segs[Math.min(state.idx, state.segs.length - 1)];
+    const at = sg ? sg.start : 0;
+    const finished = state.segs.length > 0 && state.idx >= state.segs.length;
+    rebuildSegments();
+    state.idx = finished ? state.segs.length : Core.findSegment(state.segs, at);
+    tts.wordOffset = 0;
+    if (state.mode === 'listen') renderReader();
+    if (wasPlaying) play();
   }
 
   /* ================= library ================= */
@@ -591,11 +699,13 @@
 
   /* ================= views ================= */
 
-  function rebuildChunks() {
+  // New segments for the current text. A player made for the old ones can't go on.
+  function rebuildSegments() {
     const doc = state.current;
-    state.chunks = doc ? Core.chunkText(doc.text) : [];
-    state.cum = Core.prefixLengths(state.chunks);
+    state.segs = doc ? planText(doc.text) : [];
+    state.cum = Core.prefixLengths(state.segs);
     state.dirty = false;
+    if (au.player && au.playerSegs !== state.segs) dropPlayer();
   }
 
   function renderView() {
@@ -648,17 +758,20 @@
     const wasEditing = state.mode === 'edit';
     if (wasEditing && sync.dirty) syncSoon(800);
     state.mode = 'listen';
-    if (state.dirty || !state.chunks.length) {
-      const n = state.chunks.length;
-      const ch = state.chunks[Math.min(state.idx, n - 1)];
+    if (state.dirty || !state.segs.length) {
+      const n = state.segs.length;
+      const sg = state.segs[Math.min(state.idx, n - 1)];
       const finished = n > 0 && state.idx >= n;
-      rebuildChunks();
-      state.idx = finished ? state.chunks.length : ch ? Core.findChunkIndex(state.chunks, ch.start) : 0;
+      rebuildSegments();
+      state.idx = finished ? state.segs.length : sg ? Core.findSegment(state.segs, sg.start) : 0;
     }
     renderView();
     if (wasEditing || !spans.length) renderReader();
+    warmVoiceSoon();
   }
 
+  // Each segment is a tappable span over its own characters of the text; what lies between
+  // segments (markup, skipped citations, blank lines) is shown as plain text.
   function renderReader() {
     const doc = state.current;
     const frag = document.createDocumentFragment();
@@ -667,16 +780,18 @@
     if (doc) {
       const text = doc.text;
       let pos = 0;
-      for (let i = 0; i < state.chunks.length; i++) {
-        const c = state.chunks[i];
-        if (c.start > pos) frag.appendChild(document.createTextNode(text.slice(pos, c.start)));
+      for (let i = 0; i < state.segs.length; i++) {
+        const sg = state.segs[i];
+        const a = Math.max(pos, sg.start);
+        const b = Math.max(a, sg.end);
+        if (a > pos) frag.appendChild(document.createTextNode(text.slice(pos, a)));
         const s = document.createElement('span');
         s.className = 'chunk';
         s.dataset.i = String(i);
-        s.textContent = text.slice(c.start, c.end);
+        s.textContent = text.slice(a, b);
         frag.appendChild(s);
         spans.push(s);
-        pos = c.end;
+        pos = b;
       }
       if (pos < text.length) frag.appendChild(document.createTextNode(text.slice(pos)));
     }
@@ -714,6 +829,7 @@
   function followSpan(s) {
     if (!state.settings.follow) return;
     if (Date.now() - lastManualScroll < 5000) return;
+    if (document.visibilityState === 'hidden') return;
     scrollToSpan(s, false);
   }
 
@@ -745,6 +861,7 @@
   }
 
   const canHighlightWords = typeof CSS !== 'undefined' && CSS.highlights && typeof window.Highlight === 'function';
+  // Marks characters [ci, ci + len) of the current sentence's span.
   function markWord(ci, len) {
     if (!canHighlightWords) return;
     const s = spans[curSpan];
@@ -772,7 +889,7 @@
   }
 
   function renderPlayer() {
-    const n = state.chunks.length;
+    const n = state.segs.length;
     const i = Math.min(state.idx, n);
     const finished = n > 0 && i >= n;
     const max = Math.max(0, n - 1);
@@ -790,6 +907,7 @@
           ? 'Finished'
           : Core.formatDuration((total - done) / (state.settings.cps * state.settings.rate)) + ' left';
     }
+    el.playerStatus.textContent = playerStatusText();
     const playing = tts.playing;
     el.playIcon.setAttribute('href', playing ? '#i-pause' : '#i-play');
     el.playBtn.setAttribute('aria-label', playing ? 'Pause' : finished ? 'Play again from the start' : 'Play');
@@ -799,15 +917,30 @@
     el.nextBtn.disabled = n === 0;
   }
 
-  /* ================= speech engine ================= */
+  // The middle of the player line: a voice getting ready, or the sleep timer.
+  function playerStatusText() {
+    if (tts.playing && au.waiting) return au.waiting;
+    if (sleep.mode === 'end') return 'Stops at the end';
+    if (sleep.until) {
+      const min = Math.max(1, Math.ceil((sleep.until - Date.now()) / 60000));
+      return `Stops in ${min} min`;
+    }
+    return '';
+  }
 
+  /* ================= reading aloud ================= */
+
+  // Two engines read the same segments: the device's speech engine (speechSynthesis, works
+  // at once, needs the screen on) and readkit's player (Natural = Kokoro, Standard = Piper:
+  // audio made on this device and played through one <audio>, so it goes on with the screen off).
   const tts = {
     ok: 'speechSynthesis' in window && typeof window.SpeechSynthesisUtterance === 'function',
     voices: [],
-    playing: false,
+    playing: false, // reading aloud, with either engine
+    engine: null, // 'device' | 'audio': the engine reading (or last read) the current text
     token: 0,
     utter: null, // kept so Chrome can't garbage-collect the utterance before onend fires
-    wordOffset: 0,
+    wordOffset: 0, // where to resume inside the current segment (characters from its start)
     lastBoundary: 0,
     lastCancelAt: 0,
     errors: 0,
@@ -817,8 +950,131 @@
     keepAlive: null,
     restartTimer: null,
     rateTimer: null,
+    pieces: [], // the current segment's spoken text in utterance-sized pieces
+    piece: 0,
+    volume: 1,
   };
   const synth = () => window.speechSynthesis;
+
+  const au = {
+    el: null, // the one <audio> the player uses for the whole session
+    voice: null, // the loaded readkit voice
+    loading: null, // { id, promise } while a voice loads
+    player: null,
+    playerSegs: null,
+    playerDoc: null,
+    waiting: '', // shown in the player line while a voice gets ready
+    broken: false, // an error this session: the device voice reads until the next start
+    naturalBroken: false, // the natural voice failed this session: the standard one reads
+    preview: null,
+    previewToken: 0,
+    installed: new Set(), // voice ids downloaded on this device
+    partial: new Map(), // voice id -> bytes of an unfinished download
+    dl: null, // { id, ctrl, done, total }: a download in progress
+    gpu: null, // WebGPU adapter present: true | false | null (not checked yet)
+    offerShown: false,
+  };
+
+  const queue = { order: [] }; // library order when listening started (Play next text automatically)
+
+  function playerSupported() {
+    try {
+      return typeof MediaSource !== 'undefined' && MediaSource.isTypeSupported('audio/webm; codecs="opus"') && typeof AudioEncoder !== 'undefined' && typeof AudioData !== 'undefined';
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function kitVoiceId(mode, acc) {
+    const key = `${mode}-${acc || accent()}`;
+    const list = KIT_VOICES[key] || [];
+    const chosen = state.settings.voices && state.settings.voices[key];
+    return list.includes(chosen) ? chosen : list[0];
+  }
+
+  // The natural voice's check on this device (calibrate()), per Chrome version.
+  const NAT_KEY = 'readout-natural-check';
+  function chromeMajor() {
+    const m = /Chrome\/(\d+)/.exec(UA);
+    return m ? m[1] : '';
+  }
+  function naturalCheck() {
+    try {
+      const v = JSON.parse(localStorage.getItem(NAT_KEY) || 'null');
+      return v && v.chrome === chromeMajor() ? v : null;
+    } catch (e) {
+      return null;
+    }
+  }
+  function recordNaturalCheck(v) {
+    try {
+      if (v) localStorage.setItem(NAT_KEY, JSON.stringify(Object.assign({ chrome: chromeMajor(), at: Date.now() }, v)));
+      else localStorage.removeItem(NAT_KEY);
+    } catch (e) {
+      /* ignore */
+    }
+  }
+  function naturalFails() {
+    const c = naturalCheck();
+    return au.gpu === false || !!(c && c.ok === false);
+  }
+
+  // The voice that reads when play is pressed: { kind: 'audio', id, mode } or { kind: 'device' }.
+  // Natural, then Standard, then the device voice, as far as they are downloaded and work here.
+  function chooseEngine() {
+    const mode = state.settings.voiceMode;
+    if (mode === 'device' || au.broken || !playerSupported()) return { kind: 'device' };
+    const nat = kitVoiceId('natural');
+    const std = kitVoiceId('standard');
+    if (mode === 'natural' && au.installed.has(nat) && !naturalFails() && !au.naturalBroken) return { kind: 'audio', id: nat, mode: 'natural' };
+    if (au.installed.has(std)) return { kind: 'audio', id: std, mode: 'standard' };
+    return { kind: 'device' };
+  }
+
+  function rateMax() {
+    return chooseEngine().kind === 'audio' ? MAX_RATE.audio : MAX_RATE.device;
+  }
+  function audioRate() {
+    return Core.clamp(state.settings.rate, 0.5, MAX_RATE.audio);
+  }
+
+  function setWaiting(text) {
+    if (au.waiting === text) return;
+    au.waiting = text;
+    if (el.playerStatus) renderPlayer();
+  }
+
+  function togglePlay() {
+    if (tts.playing) pausePlayback();
+    else play();
+  }
+
+  function play(fromIdx, opts) {
+    const o = opts || {};
+    if (!state.current) return;
+    if (state.mode !== 'listen') setMode('listen');
+    if (!state.current || !state.segs.length) {
+      toast('There’s nothing to read in this text yet.');
+      return;
+    }
+    stopDictation();
+    stopPreview();
+    if (typeof fromIdx === 'number') {
+      state.idx = Core.clamp(fromIdx, 0, state.segs.length - 1);
+      tts.wordOffset = 0;
+    }
+    if (state.idx >= state.segs.length) {
+      state.idx = 0;
+      tts.wordOffset = 0;
+    }
+    lastManualScroll = 0;
+    if (!tts.playing && !o.queued) queue.order = sortedDocs().map((d) => d.id);
+    const eng = chooseEngine();
+    if (eng.kind === 'audio') playAudio(eng);
+    else playDevice();
+  }
+
+  /* ---------- the device voice (speechSynthesis) ---------- */
 
   function clearSpeechTimers() {
     clearInterval(tts.watchdog);
@@ -830,7 +1086,7 @@
   function cancelSpeech() {
     try {
       const s = synth();
-      if (s.speaking || s.pending || s.paused) {
+      if (s && (s.speaking || s.pending || s.paused)) {
         s.cancel();
         tts.lastCancelAt = Date.now();
       }
@@ -872,38 +1128,28 @@
     return !!d && d.localService === false;
   }
 
-  function togglePlay() {
-    if (tts.playing) pausePlayback();
-    else play();
-  }
-
-  function play(fromIdx) {
-    if (!state.current) return;
+  function playDevice() {
     if (!tts.ok) {
       toast('This browser can’t read aloud. Open Readout in Chrome.');
       return;
     }
-    if (state.mode !== 'listen') setMode('listen');
-    if (!state.current || !state.chunks.length) {
-      toast('There’s nothing to read in this text yet.');
-      return;
-    }
-    stopDictation();
-    if (typeof fromIdx === 'number') {
-      state.idx = Core.clamp(fromIdx, 0, state.chunks.length - 1);
-      tts.wordOffset = 0;
-    }
-    if (state.idx >= state.chunks.length) {
-      state.idx = 0;
-      tts.wordOffset = 0;
-    }
-    lastManualScroll = 0;
+    if (tts.engine === 'audio' && au.player) au.player.pause();
     const wasPlaying = tts.playing;
     tts.playing = true;
+    tts.engine = 'device';
     tts.errors = 0;
     tts.fastEnds = 0;
+    setWaiting('');
     if (!wasPlaying) onPlaybackStart();
     speakCurrent(true);
+    offerVoiceOnce();
+  }
+
+  // Source offset (from the segment start) of the spoken word at or after spoken index i.
+  function sourceAt(sg, i) {
+    const a = sg.align || [];
+    for (let k = 0; k < a.length; k++) if (a[k][1] > i) return Core.wordRange(sg, k)[0];
+    return 0;
   }
 
   function speakCurrent(interrupt) {
@@ -913,98 +1159,25 @@
 
     const run = () => {
       if (my !== tts.token || !tts.playing) return;
-      const doc = state.current;
-      const ch = state.chunks[state.idx];
-      if (!doc || !ch) {
+      const sg = state.segs[state.idx];
+      if (!state.current || !sg) {
         finishPlayback();
         return;
       }
-      const raw = doc.text.slice(ch.start, ch.end);
-      const off = tts.wordOffset > 0 && tts.wordOffset < raw.length ? tts.wordOffset : 0;
+      // Resume at the word where reading stopped, or the segment's start.
+      const from = Core.spokenStartFor(sg, tts.wordOffset);
       tts.wordOffset = 0;
-      const spoken = Core.speakable(raw).slice(off);
+      const rest = String(sg.spoken || '').slice(from);
       highlightChunk(state.idx);
-      if (!/[\p{L}\p{N}]/u.test(spoken)) {
+      if (!/[\p{L}\p{N}]/u.test(rest)) {
         advance(my);
         return;
       }
-
-      const u = new SpeechSynthesisUtterance(spoken);
-      u.rate = state.settings.rate;
-      u.pitch = state.settings.pitch;
-      u.volume = 1;
-      const voice = currentVoice();
-      if (voice) {
-        u.voice = voice;
-        u.lang = Core.normalizeLang(voice.lang);
-      }
-      const expectedMs = (spoken.length / (state.settings.cps * state.settings.rate)) * 1000;
-      const t0 = performance.now();
-      let finished = false;
-      let forced = false;
-      tts.lastBoundary = off;
-
-      const done = (kind, ev) => {
-        if (finished || my !== tts.token) return;
-        finished = true;
-        clearSpeechTimers();
-        if (kind === 'end' || forced) onUtteranceEnd(my, spoken.length, performance.now() - t0, expectedMs, !!voice);
-        else onUtteranceError(my, ev, off, !!voice);
-      };
-      u.onend = () => done('end');
-      u.onerror = (ev) => done('error', ev);
-      u.onboundary = (ev) => {
-        if (my !== tts.token || finished) return;
-        if (ev.name && ev.name !== 'word') return;
-        const ci = off + (ev.charIndex || 0);
-        tts.lastBoundary = ci;
-        markWord(ci, ev.charLength);
-      };
-      tts.utter = u;
-
-      try {
-        const s = synth();
-        if (s.paused) s.resume();
-        s.speak(u);
-      } catch (e) {
-        done('error', { error: 'synthesis-failed' });
-        return;
-      }
-
-      // Some engines never fire onend. If speech stopped (or is stuck), move on.
-      const startedAt = Date.now();
-      tts.watchdog = setInterval(() => {
-        if (my !== tts.token || finished) {
-          clearInterval(tts.watchdog);
-          return;
-        }
-        const s = synth();
-        const elapsed = Date.now() - startedAt;
-        if (!s.speaking && !s.pending && elapsed > 1500) {
-          done('end');
-        } else if (elapsed > expectedMs * 3 + 12000) {
-          forced = true;
-          try {
-            s.cancel();
-            tts.lastCancelAt = Date.now();
-          } catch (e) {
-            /* ignore */
-          }
-          setTimeout(() => done('end'), 250);
-        }
-      }, 700);
-
-      // Chrome on desktop stops online voices after ~15 s unless nudged.
-      if (!IS_ANDROID && isOnlineVoice(voice)) {
-        tts.keepAlive = setInterval(() => {
-          if (my !== tts.token || finished) return;
-          const s = synth();
-          if (s.speaking && !s.paused) {
-            s.pause();
-            s.resume();
-          }
-        }, 10000);
-      }
+      // Android's engine caps an utterance's length and Chrome's online voices stop after
+      // ~15 s, so a long segment is spoken in pieces.
+      tts.pieces = kit.system.chunkText(rest).map((c) => ({ start: from + c.start, end: from + c.end }));
+      tts.piece = 0;
+      speakPiece(my);
       queuePositionSave();
       updateMediaSession();
     };
@@ -1018,6 +1191,95 @@
       else run();
     } else {
       run();
+    }
+  }
+
+  function speakPiece(my) {
+    if (my !== tts.token || !tts.playing) return;
+    const sg = state.segs[state.idx];
+    const pc = tts.pieces[tts.piece];
+    if (!sg || !pc) {
+      advance(my);
+      return;
+    }
+    const spoken = sg.spoken.slice(pc.start, pc.end);
+    const u = new SpeechSynthesisUtterance(spoken);
+    u.rate = state.settings.rate;
+    u.pitch = state.settings.pitch;
+    u.volume = tts.volume;
+    const voice = currentVoice();
+    if (voice) {
+      u.voice = voice;
+      u.lang = Core.normalizeLang(voice.lang);
+    }
+    const expectedMs = (spoken.length / (state.settings.cps * state.settings.rate)) * 1000;
+    const t0 = performance.now();
+    let finished = false;
+    let forced = false;
+    tts.lastBoundary = sourceAt(sg, pc.start);
+
+    const done = (kind, ev) => {
+      if (finished || my !== tts.token) return;
+      finished = true;
+      clearSpeechTimers();
+      if (kind === 'end' || forced) onUtteranceEnd(my, spoken.length, performance.now() - t0, expectedMs, !!voice);
+      else onUtteranceError(my, ev, !!voice);
+    };
+    u.onend = () => done('end');
+    u.onerror = (ev) => done('error', ev);
+    u.onboundary = (ev) => {
+      if (my !== tts.token || finished) return;
+      if (ev.name && ev.name !== 'word') return;
+      const k = Core.alignAtSpoken(sg, pc.start + (ev.charIndex || 0));
+      const r = k >= 0 ? Core.wordRange(sg, k) : null;
+      if (!r) return;
+      tts.lastBoundary = r[0];
+      markWord(r[0], r[1]);
+    };
+    tts.utter = u;
+
+    try {
+      const s = synth();
+      if (s.paused) s.resume();
+      s.speak(u);
+    } catch (e) {
+      done('error', { error: 'synthesis-failed' });
+      return;
+    }
+
+    // Some engines never fire onend. If speech stopped (or is stuck), move on.
+    const startedAt = Date.now();
+    tts.watchdog = setInterval(() => {
+      if (my !== tts.token || finished) {
+        clearInterval(tts.watchdog);
+        return;
+      }
+      const s = synth();
+      const elapsed = Date.now() - startedAt;
+      if (!s.speaking && !s.pending && elapsed > 1500) {
+        done('end');
+      } else if (elapsed > expectedMs * 3 + 12000) {
+        forced = true;
+        try {
+          s.cancel();
+          tts.lastCancelAt = Date.now();
+        } catch (e) {
+          /* ignore */
+        }
+        setTimeout(() => done('end'), 250);
+      }
+    }, 700);
+
+    // Chrome on desktop stops online voices after ~15 s unless nudged.
+    if (!IS_ANDROID && isOnlineVoice(voice)) {
+      tts.keepAlive = setInterval(() => {
+        if (my !== tts.token || finished) return;
+        const s = synth();
+        if (s.speaking && !s.paused) {
+          s.pause();
+          s.resume();
+        }
+      }, 10000);
     }
   }
 
@@ -1046,15 +1308,20 @@
       tts.fastEnds = 0;
     }
     tts.errors = 0;
+    if (tts.piece + 1 < tts.pieces.length) {
+      tts.piece++;
+      speakPiece(my);
+      return;
+    }
     advance(my);
   }
 
-  function onUtteranceError(my, ev, off, usedVoice) {
+  function onUtteranceError(my, ev, usedVoice) {
     const code = (ev && ev.error) || 'unknown';
     if (code === 'interrupted' || code === 'canceled') {
       // Something outside Readout cut in (a call, another app). Keep the place.
       if (tts.playing) {
-        tts.wordOffset = Math.max(off, tts.lastBoundary || 0);
+        tts.wordOffset = tts.lastBoundary || 0;
         pausePlayback({ keepOffset: true });
       }
       return;
@@ -1072,7 +1339,7 @@
           ? 'The online voice lost its connection, so Readout switched to the default voice.'
           : 'That voice didn’t work here, so Readout switched to the default voice.'
       );
-      tts.wordOffset = off;
+      tts.wordOffset = tts.lastBoundary || 0;
       speakCurrent(false);
       return;
     }
@@ -1084,70 +1351,408 @@
     advance(my);
   }
 
+  // On to the next segment, after a short break where the text has one (paragraphs, headings).
   function advance(my) {
     if (my !== tts.token || !tts.playing) return;
-    if (state.idx + 1 >= state.chunks.length) {
+    if (state.idx + 1 >= state.segs.length) {
       finishPlayback();
       return;
     }
-    state.idx++;
-    speakCurrent(false);
+    const sg = state.segs[state.idx];
+    const gap = sg && sg.pauseAfterMs ? Math.min(600, Math.round(sg.pauseAfterMs / 2 / state.settings.rate)) : 0;
+    const go = () => {
+      if (my !== tts.token || !tts.playing) return;
+      state.idx++;
+      speakCurrent(false);
+    };
+    if (gap > 40) tts.restartTimer = setTimeout(go, gap);
+    else go();
   }
+
+  function restartPlaybackAtWord(delay) {
+    if (!tts.playing || tts.engine !== 'device') return;
+    clearTimeout(tts.rateTimer);
+    tts.rateTimer = setTimeout(() => {
+      if (!tts.playing || tts.engine !== 'device') return;
+      tts.wordOffset = tts.lastBoundary || 0;
+      speakCurrent(true);
+    }, delay);
+  }
+
+  /* ---------- the natural and standard voices (readkit player) ---------- */
+
+  function icon(s) {
+    return { src: new URL(`icons/icon-${s}.png`, location.href).href, sizes: `${s}x${s}`, type: 'image/png' };
+  }
+
+  async function playAudio(eng) {
+    const my = ++tts.token;
+    if (tts.engine === 'device') {
+      clearSpeechTimers();
+      clearTimeout(tts.restartTimer);
+      cancelSpeech();
+    }
+    const wasPlaying = tts.playing;
+    tts.playing = true;
+    tts.engine = 'audio';
+    tts.wordOffset = 0;
+    if (!wasPlaying) onPlaybackStart();
+    highlightChunk(state.idx);
+    const p = au.player;
+    if (p && au.playerDoc === state.current && au.playerSegs === state.segs && au.voice && au.voice.id === eng.id && p.state !== 'ended' && p.state !== 'error') {
+      if (p.index !== state.idx) p.seek(state.idx);
+      p.setSpeed(audioRate());
+      p.play();
+      return;
+    }
+    dropPlayer();
+    let voice;
+    try {
+      [voice] = await Promise.all([ensureVoice(eng.id), playerModule()]);
+    } catch (e) {
+      if (my !== tts.token || isAbort(e)) return;
+      audioFailed(e, eng);
+      return;
+    }
+    if (my !== tts.token || !tts.playing || !state.current) return; // paused while the voice loaded
+    try {
+      startPlayer(voice);
+      au.player.play();
+    } catch (e) {
+      audioFailed(e, eng);
+    }
+  }
+
+  function startPlayer(voice) {
+    const doc = state.current;
+    const segs = state.segs;
+    let player = null;
+    const mine = () => player && au.player === player;
+    player = kit.P.createPlayer({
+      audio: au.el,
+      voice,
+      segments: segs,
+      startAt: Math.min(state.idx, segs.length - 1),
+      speed: audioRate(),
+      metadata: { title: doc.title, artist: 'Readout', artwork: [icon(192), icon(512)] },
+      onSegment: (i) => mine() && onAudioSegment(i),
+      onWord: (i, k) => mine() && onAudioWord(i, k),
+      onState: (s) => mine() && onAudioState(s),
+      onError: (e) => mine() && onAudioError(e),
+    });
+    au.player = player;
+    au.playerSegs = segs;
+    au.playerDoc = doc;
+  }
+
+  function dropPlayer() {
+    const p = au.player;
+    if (!p) return;
+    au.player = null;
+    au.playerSegs = null;
+    au.playerDoc = null;
+    try {
+      p.destroy();
+    } catch (e) {
+      /* ignore */
+    }
+    if (tts.engine === 'audio' && tts.playing) {
+      tts.playing = false;
+      onPlaybackStop();
+    }
+    // The player's lock-screen controls went with it; the device voice's come back.
+    setupMediaSession();
+    updateMediaSession();
+  }
+
+  function onAudioSegment(i) {
+    if (i !== state.idx || curSpan !== i) {
+      state.idx = i;
+      tts.wordOffset = 0;
+      highlightChunk(i);
+      queuePositionSave();
+    }
+    sleepCheck();
+  }
+
+  function onAudioWord(i, k) {
+    if (i !== curSpan) return;
+    const r = Core.wordRange(state.segs[i], k);
+    if (r) markWord(r[0], r[1]);
+  }
+
+  // A player that makes no audio for this long (a voice that hangs) counts as failed.
+  const STALL_MS = { loading: 60000, buffering: 30000 };
+  let stallTimer = null;
+  function watchStall(s) {
+    clearTimeout(stallTimer);
+    stallTimer = null;
+    if (!STALL_MS[s]) return;
+    const p = au.player;
+    stallTimer = setTimeout(() => {
+      if (au.player === p && p && p.state === s && tts.playing && tts.engine === 'audio') audioFailed(Object.assign(new Error('The voice stopped making audio'), { code: 'stalled' }), { id: au.voice && au.voice.id });
+    }, STALL_MS[s]);
+  }
+
+  function onAudioState(s) {
+    watchStall(s);
+    if (s === 'playing' || s === 'loading' || s === 'buffering') {
+      setWaiting(s === 'loading' ? 'Getting the voice ready…' : s === 'buffering' ? 'Catching up…' : '');
+      if (!tts.playing) {
+        // Started from the lock screen or the notification.
+        tts.playing = true;
+        tts.engine = 'audio';
+        onPlaybackStart();
+      }
+    } else if (s === 'paused') {
+      setWaiting('');
+      if (tts.playing && tts.engine === 'audio') {
+        tts.playing = false;
+        tts.token++;
+        clearWord();
+        onPlaybackStop();
+        savePositionNow();
+      }
+    } else if (s === 'ended') {
+      setWaiting('');
+      if (tts.engine === 'audio' && state.idx < state.segs.length) finishPlayback();
+    }
+    renderPlayer();
+  }
+
+  function onAudioError(e) {
+    if (!e) return;
+    if (e.code === 'segment') {
+      console.warn('Readout: a sentence couldn’t be spoken and was skipped', e);
+      return;
+    }
+    if (e.code === 'not-allowed') {
+      pausePlayback();
+      toast('Tap play to start reading.');
+      return;
+    }
+    audioFailed(e, { id: au.voice && au.voice.id });
+  }
+
+  function voiceName(id) {
+    const v = kit.V && id ? kit.V.findVoice(id) : null;
+    return v ? v.name : 'The voice';
+  }
+
+  // A voice that can't load or stops: say so and go on with the next voice that can read.
+  function audioFailed(e, eng) {
+    console.warn('Readout voice error', e);
+    const id = (eng && eng.id) || '';
+    const name = voiceName(id);
+    const wasPlaying = tts.playing;
+    dropPlayer();
+    if (au.voice && (!id || au.voice.id === id)) {
+      au.voice.dispose();
+      au.voice = null;
+    }
+    tts.engine = null;
+    if (e && e.code === 'calibrate') {
+      const std = kitVoiceId('standard');
+      const next = chooseEngine();
+      toast(
+        next.kind === 'audio'
+          ? `${name} doesn’t run well on this device, so Readout is using ${voiceName(next.id)}, the standard voice.`
+          : `${name} doesn’t run well on this device. The standard voice (63 MB) works on any phone.`,
+        next.kind === 'audio' ? {} : { action: 'Get it', onAction: () => askDownload(std) }
+      );
+      renderVoicePanel();
+    } else if (e && e.code === 'quota' && !e.index) {
+      au.broken = true;
+      toast('This device ran out of room for the audio, so Readout switched to the device voice.');
+    } else {
+      // The natural voice gave out (a graphics driver, say): the standard voice, if it's here,
+      // also reads with the screen off; the device voice doesn't.
+      const kokoro = kit.V && id && kit.V.findVoice(id) && kit.V.findVoice(id).engine === 'kokoro';
+      if (kokoro) au.naturalBroken = true;
+      const next = kokoro ? chooseEngine() : { kind: 'device' };
+      if (next.kind === 'audio') toast(`${name} stopped working, so Readout switched to ${voiceName(next.id)}, the standard voice.`);
+      else {
+        au.broken = true;
+        toast(`${name} stopped working, so Readout switched to the device voice.`);
+      }
+    }
+    if (wasPlaying && state.current) {
+      tts.playing = false;
+      play();
+    } else renderPlayer();
+  }
+
+  const isAbort = (e) => !!e && (e.name === 'AbortError' || e.code === 'aborted');
+
+  // Loads a downloaded voice (one at a time). The natural voice is checked on this device the
+  // first time (speed, and output a broken graphics driver would spoil).
+  async function ensureVoice(id) {
+    if (au.voice && au.voice.id === id) return au.voice;
+    if (au.loading && au.loading.id === id) return au.loading.promise;
+    const V = await voiceModule();
+    if (au.voice) {
+      if (au.player) dropPlayer();
+      stopPreview();
+      au.voice.dispose();
+      au.voice = null;
+    }
+    const entry = V.findVoice(id);
+    const promise = (async () => {
+      if (entry.engine === 'kokoro' && !(await hasWebGpu())) throw Object.assign(new Error('No WebGPU'), { code: 'calibrate', reason: 'webgpu' });
+      setWaiting(`Loading ${entry.name}…`);
+      const voice = await V.createVoice({ id, source: 'store' });
+      if (entry.engine === 'kokoro') {
+        setWaiting(`Checking ${entry.name} on this device…`);
+        let cal;
+        try {
+          cal = await voice.calibrate({ speed: 1 });
+        } catch (e) {
+          voice.dispose();
+          throw e;
+        }
+        recordNaturalCheck({ ok: cal.ok, reason: cal.reason || null, rt: cal.rt || 0 });
+        if (!cal.ok) {
+          voice.dispose();
+          throw Object.assign(new Error(cal.message || cal.reason || 'calibration failed'), { code: 'calibrate', reason: cal.reason });
+        }
+      }
+      return voice;
+    })();
+    const job = { id, promise };
+    au.loading = job;
+    try {
+      const voice = await promise;
+      if (au.loading !== job) {
+        voice.dispose();
+        throw new DOMException('Another voice was chosen', 'AbortError');
+      }
+      au.voice = voice;
+      return voice;
+    } catch (e) {
+      if (e && e.code === 'calibrate' && e.reason === 'webgpu') {
+        au.gpu = false;
+        recordNaturalCheck({ ok: false, reason: 'webgpu' });
+      }
+      throw e;
+    } finally {
+      if (au.loading === job) au.loading = null;
+      setWaiting('');
+    }
+  }
+
+  async function hasWebGpu() {
+    if (au.gpu !== null) return au.gpu;
+    try {
+      au.gpu = !!(navigator.gpu && (await navigator.gpu.requestAdapter()));
+    } catch (e) {
+      au.gpu = false;
+    }
+    return au.gpu;
+  }
+
+  // Gets the voice ready a moment after a text opens, so play starts at once.
+  let warmTimer = null;
+  function warmVoiceSoon() {
+    clearTimeout(warmTimer);
+    warmTimer = setTimeout(() => {
+      if (document.visibilityState !== 'visible' || !state.current || state.mode !== 'listen' || tts.playing) return;
+      const eng = chooseEngine();
+      if (eng.kind !== 'audio' || (au.voice && au.voice.id === eng.id) || au.loading) return;
+      Promise.all([ensureVoice(eng.id), playerModule()]).catch((e) => {
+        if (isAbort(e)) return;
+        if (e && e.code === 'calibrate') audioFailed(e, eng);
+        else console.warn('Readout: the voice didn’t load', e);
+      });
+    }, 1200);
+  }
+
+  /* ---------- playing, pausing, moving ---------- */
 
   function pausePlayback(opts) {
     if (!tts.playing) return;
     const o = opts || {};
     tts.playing = false;
     tts.token++;
-    clearSpeechTimers();
-    clearTimeout(tts.restartTimer);
-    clearTimeout(tts.rateTimer);
-    if (!o.keepOffset) tts.wordOffset = tts.lastBoundary > 0 ? tts.lastBoundary : 0;
-    cancelSpeech();
+    if (tts.engine === 'audio') {
+      if (au.player) au.player.pause();
+      tts.wordOffset = 0;
+    } else {
+      clearSpeechTimers();
+      clearTimeout(tts.restartTimer);
+      clearTimeout(tts.rateTimer);
+      if (!o.keepOffset) tts.wordOffset = tts.lastBoundary > 0 ? tts.lastBoundary : 0;
+      cancelSpeech();
+    }
+    setWaiting('');
     clearWord();
     onPlaybackStop();
     savePositionNow();
   }
 
   function finishPlayback() {
+    const doc = state.current;
     tts.playing = false;
     tts.token++;
     clearSpeechTimers();
     clearWord();
-    state.idx = state.chunks.length;
+    setWaiting('');
+    state.idx = state.segs.length;
     tts.wordOffset = 0;
     highlightChunk(state.idx, { scroll: false });
     onPlaybackStop();
     savePositionNow(true);
-    toast('Finished reading.');
+    const byTimer = sleep.mode === 'end';
+    if (byTimer) setSleep(0);
+    const next = !byTimer && state.settings.autoNext && doc ? Core.nextInOrder(queue.order, doc.id, isFinished) : null;
+    if (next && state.docs.some((d) => d.id === next)) {
+      playNext(next);
+      return;
+    }
+    toast(byTimer ? 'Sleep timer: stopped at the end of the text.' : 'Finished reading.');
+  }
+
+  function isFinished(id) {
+    const p = state.positions.get(id);
+    return !!(p && p.done);
+  }
+
+  // Play next text automatically: the next one in the library's order when listening began.
+  function playNext(id) {
+    const d = state.docs.find((x) => x.id === id);
+    if (!d || !d.text.trim()) return;
+    openDoc(id, { mode: 'listen', keepPlaying: true });
+    toast(`Next: “${d.title}”.`);
+    play(undefined, { queued: true });
   }
 
   function skip(delta) {
-    const n = state.chunks.length;
+    const n = state.segs.length;
     if (!n) return;
     const base = state.idx >= n ? n : state.idx;
-    state.idx = Core.clamp(base + delta, 0, n - 1);
-    tts.wordOffset = 0;
-    lastManualScroll = 0;
-    if (tts.playing) speakCurrent(true);
-    else {
-      highlightChunk(state.idx, { scroll: 'force' });
-      queuePositionSave();
-    }
+    seekTo(Core.clamp(base + delta, 0, n - 1));
   }
 
-  function restartPlaybackAtWord(delay) {
-    if (!tts.playing) return;
-    clearTimeout(tts.rateTimer);
-    tts.rateTimer = setTimeout(() => {
-      if (!tts.playing) return;
-      tts.wordOffset = tts.lastBoundary || 0;
+  // Jumps to a segment: tap, scrub, previous/next, a heading.
+  function seekTo(i) {
+    const n = state.segs.length;
+    if (!n) return;
+    i = Core.clamp(i, 0, n - 1);
+    state.idx = i;
+    tts.wordOffset = 0;
+    lastManualScroll = 0;
+    if (tts.playing && tts.engine === 'device') {
       speakCurrent(true);
-    }, delay);
+      return;
+    }
+    // A paused player follows too, so play from the lock screen starts here.
+    if (au.player && au.player.state !== 'ended' && au.player.state !== 'error') au.player.seek(i);
+    else if (au.player && !tts.playing) dropPlayer();
+    highlightChunk(i, { scroll: 'force' });
+    if (!tts.playing) queuePositionSave();
   }
 
   function setRate(r) {
-    const rate = Math.round(Core.clamp(Number(r) || 1, 0.5, 4) * 100) / 100;
+    const rate = Math.round(Core.clamp(Number(r) || 1, 0.5, rateMax()) * 100) / 100;
     if (rate === state.settings.rate) {
       renderRate();
       return;
@@ -1156,6 +1761,8 @@
     saveSettings();
     renderRate();
     renderPlayer();
+    if (au.player) au.player.setSpeed(audioRate());
+    if (au.preview) au.preview.setSpeed(audioRate());
     restartPlaybackAtWord(400);
   }
 
@@ -1166,34 +1773,97 @@
     restartPlaybackAtWord(400);
   }
 
-  function setVoice(uri) {
+  function setDeviceVoice(uri) {
     state.settings.voiceURI = uri || '';
     tts.voiceBroken = false;
     saveSettings();
     restartPlaybackAtWord(150);
   }
 
-  function previewVoice() {
-    if (!tts.ok) return;
-    pausePlayback();
-    cancelSpeech();
-    const u = new SpeechSynthesisUtterance('This is how this voice sounds at this speed.');
-    u.rate = state.settings.rate;
-    u.pitch = state.settings.pitch;
-    const v = Core.pickVoice(tts.voices, state.settings.voiceURI);
-    if (v) {
-      u.voice = v;
-      u.lang = Core.normalizeLang(v.lang);
-    }
-    tts.utter = u;
-    const wait = Math.max(0, (IS_ANDROID ? 180 : 80) - (Date.now() - tts.lastCancelAt));
-    setTimeout(() => {
+  /* ---------- preview ---------- */
+
+  const PREVIEW_TEXT = 'This is how this voice sounds at this speed. On the third of June, Dr. Patel read 1,250 pages.';
+
+  function stopPreview() {
+    au.previewToken++;
+    const p = au.preview;
+    au.preview = null;
+    if (p) {
       try {
-        synth().speak(u);
+        p.destroy();
       } catch (e) {
         /* ignore */
       }
-    }, wait);
+    }
+  }
+
+  async function previewVoice() {
+    pausePlayback();
+    cancelSpeech();
+    stopPreview();
+    const mode = state.settings.voiceMode;
+    if (mode === 'device') {
+      if (!tts.ok) return;
+      const u = new SpeechSynthesisUtterance('This is how this voice sounds at this speed.');
+      u.rate = state.settings.rate;
+      u.pitch = state.settings.pitch;
+      const v = Core.pickVoice(tts.voices, state.settings.voiceURI);
+      if (v) {
+        u.voice = v;
+        u.lang = Core.normalizeLang(v.lang);
+      }
+      tts.utter = u;
+      const wait = Math.max(0, (IS_ANDROID ? 180 : 80) - (Date.now() - tts.lastCancelAt));
+      setTimeout(() => {
+        try {
+          synth().speak(u);
+        } catch (e) {
+          /* ignore */
+        }
+      }, wait);
+      return;
+    }
+    const id = kitVoiceId(mode);
+    if (!au.installed.has(id)) {
+      askDownload(id);
+      return;
+    }
+    if (mode === 'natural' && naturalFails()) {
+      toast(`${voiceName(id)} doesn’t run well on this device.`);
+      return;
+    }
+    const my = ++au.previewToken;
+    el.previewBtn.disabled = true;
+    try {
+      const [voice] = await Promise.all([ensureVoice(id), playerModule()]);
+      if (my !== au.previewToken) return;
+      let pv = null;
+      pv = kit.P.createPlayer({
+        audio: el.previewAudio,
+        voice,
+        segments: kit.K.plan(PREVIEW_TEXT, planOptions()),
+        speed: audioRate(),
+        cache: false,
+        mediaSession: false,
+        onState: (s) => {
+          if (s === 'ended' && pv && au.preview === pv) stopPreview();
+        },
+        onError: (e) => {
+          if (e && e.code !== 'segment' && pv && au.preview === pv) {
+            stopPreview();
+            toast(`Couldn’t play ${voiceName(id)} here.`);
+          }
+        },
+      });
+      au.preview = pv;
+      pv.play();
+    } catch (e) {
+      if (isAbort(e)) return;
+      if (e && e.code === 'calibrate') audioFailed(e, { id });
+      else toast(`Couldn’t play ${voiceName(id)} here.`);
+    } finally {
+      el.previewBtn.disabled = false;
+    }
   }
 
   /* ---------- keeping the phone awake, lock-screen controls ---------- */
@@ -1231,57 +1901,10 @@
     },
   };
 
-  function silentWavUrl(seconds) {
-    const rate = 8000;
-    const n = rate * seconds;
-    const buf = new ArrayBuffer(44 + n);
-    const v = new DataView(buf);
-    const w = (o, str) => {
-      for (let i = 0; i < str.length; i++) v.setUint8(o + i, str.charCodeAt(i));
-    };
-    w(0, 'RIFF');
-    v.setUint32(4, 36 + n, true);
-    w(8, 'WAVE');
-    w(12, 'fmt ');
-    v.setUint32(16, 16, true);
-    v.setUint16(20, 1, true);
-    v.setUint16(22, 1, true);
-    v.setUint32(24, rate, true);
-    v.setUint32(28, rate, true);
-    v.setUint16(32, 1, true);
-    v.setUint16(34, 8, true);
-    w(36, 'data');
-    v.setUint32(40, n, true);
-    new Uint8Array(buf, 44).fill(128);
-    return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
-  }
-
-  // Experimental: a silent looping track gives the page an active media session,
-  // which can keep Android from suspending it when the screen locks.
-  const bgAudio = {
-    audio: null,
-    start() {
-      if (!state.settings.background) return;
-      try {
-        if (!this.audio) {
-          this.audio = new Audio(silentWavUrl(12));
-          this.audio.loop = true;
-          this.audio.preload = 'auto';
-          this.audio.setAttribute('playsinline', '');
-        }
-        const p = this.audio.play();
-        if (p && p.catch) p.catch(() => {});
-      } catch (e) {
-        /* ignore */
-      }
-    },
-    stop() {
-      if (this.audio) this.audio.pause();
-    },
-  };
-
+  // The device voice's lock-screen controls. While the player reads, it has its own
+  // (previous/next sentence, seek bar), and these come back when it is gone.
   function setupMediaSession() {
-    if (!('mediaSession' in navigator)) return;
+    if (!('mediaSession' in navigator) || au.player) return;
     const h = (action, fn) => {
       try {
         navigator.mediaSession.setActionHandler(action, fn);
@@ -1296,18 +1919,16 @@
     h('nexttrack', () => skip(1));
     h('seekbackward', () => skip(-1));
     h('seekforward', () => skip(1));
+    h('seekto', null);
   }
 
   function updateMediaSession() {
-    if (!('mediaSession' in navigator)) return;
+    if (!('mediaSession' in navigator) || au.player) return;
     try {
       const doc = state.current;
       if (doc && typeof window.MediaMetadata === 'function') {
         const md = navigator.mediaSession.metadata;
-        if (!md || md.title !== doc.title) {
-          const icon = (s) => ({ src: new URL(`icons/icon-${s}.png`, location.href).href, sizes: `${s}x${s}`, type: 'image/png' });
-          navigator.mediaSession.metadata = new MediaMetadata({ title: doc.title, artist: 'Readout', artwork: [icon(192), icon(512)] });
-        }
+        if (!md || md.title !== doc.title) navigator.mediaSession.metadata = new MediaMetadata({ title: doc.title, artist: 'Readout', artwork: [icon(192), icon(512)] });
       }
       navigator.mediaSession.playbackState = tts.playing ? 'playing' : 'paused';
     } catch (e) {
@@ -1316,19 +1937,498 @@
   }
 
   function onPlaybackStart() {
-    if (state.settings.keepAwake) wake.want('play', true);
-    bgAudio.start();
+    if (state.settings.keepAwake && tts.engine === 'device') wake.want('play', true);
     updateMediaSession();
     renderPlayer();
   }
 
   function onPlaybackStop() {
     wake.want('play', false);
-    bgAudio.stop();
     updateMediaSession();
     saveSettings();
     renderPlayer();
     syncSoon(1500);
+  }
+
+  /* ---------- sleep timer ---------- */
+
+  // 15-60 minutes, or the end of the text. The last 10 s fade out. It runs on timers that a
+  // page playing audio keeps getting with the screen off, and on each sentence the player reports.
+  const sleep = { mode: 0, until: 0, timer: null, fadeMs: 10000, lastMin: -1 };
+
+  function setSleep(v) {
+    clearInterval(sleep.timer);
+    sleep.timer = null;
+    sleep.until = 0;
+    sleep.mode = 0;
+    sleep.lastMin = -1;
+    setVolume(1);
+    if (v === 'end') sleep.mode = 'end';
+    else if (Number(v) > 0) {
+      sleep.mode = Number(v);
+      sleep.until = Date.now() + Number(v) * 60000;
+      sleep.timer = setInterval(sleepCheck, 500);
+    }
+    renderSleep();
+    renderPlayer();
+  }
+
+  function sleepCheck() {
+    if (!sleep.until) return;
+    const left = sleep.until - Date.now();
+    const min = Math.ceil(left / 60000);
+    if (min !== sleep.lastMin) {
+      sleep.lastMin = min;
+      renderPlayer();
+      renderSleep();
+    }
+    if (left > sleep.fadeMs) return;
+    setVolume(Core.fadeGain(left, sleep.fadeMs));
+    if (left > 0) return;
+    const was = tts.playing;
+    pausePlayback();
+    setSleep(0);
+    if (was) toast('Sleep timer: stopped reading.');
+  }
+
+  function setVolume(g) {
+    tts.volume = g;
+    if (au.el) au.el.volume = g;
+  }
+
+  function renderSleep() {
+    if (!el.sleepChips) return;
+    const cur = sleep.mode === 'end' ? 'end' : String(sleep.mode || 0);
+    for (const b of el.sleepChips.querySelectorAll('[data-sleep]')) b.setAttribute('aria-pressed', String(b.dataset.sleep === cur));
+    el.sleepValue.textContent = sleep.mode === 'end' ? 'At the end of the text' : sleep.until ? `${Math.max(1, Math.ceil((sleep.until - Date.now()) / 60000))} min left` : 'Off';
+  }
+
+  /* ================= voices: downloads, choices ================= */
+
+  const MB = 1e6;
+  const fmtMB = (b) => (b >= 10 * MB ? Math.round(b / MB) : Math.max(0.1, Math.round(b / 1e5) / 10)) + ' MB';
+  const ACCENT_NAME = { 'en-US': 'American', 'en-GB': 'British' };
+  const MODE_NAME = { natural: 'Natural', standard: 'Standard', device: 'Device' };
+  const allKitVoices = () => [...new Set(Object.values(KIT_VOICES).flat())];
+  const voiceInfo = new Map(); // id -> { installed, need, total, partial }
+
+  // What's downloaded (and half downloaded) on this device.
+  async function refreshVoices() {
+    let V;
+    try {
+      V = await voiceModule();
+    } catch (e) {
+      return;
+    }
+    await Promise.all(
+      allKitVoices().map(async (id) => {
+        try {
+          const st = await V.voiceStore.status(id);
+          const partial = st.files.some((f) => f.bytes > 0 && !f.complete);
+          voiceInfo.set(id, { installed: st.installed, need: Math.max(0, st.total - st.bytes), total: st.total, partial, bytes: st.bytes });
+          if (st.installed) au.installed.add(id);
+          else au.installed.delete(id);
+        } catch (e) {
+          /* OPFS unavailable: nothing is installed */
+        }
+      })
+    );
+    renderVoicePanel();
+    renderVoiceList();
+  }
+
+  function netText() {
+    if (navigator.onLine === false) return 'Offline';
+    const c = navigator.connection;
+    const t = c && c.type;
+    if (t === 'wifi') return 'Wi-Fi';
+    if (t === 'ethernet') return 'Wired network';
+    if (t === 'cellular') return 'Mobile data';
+    if (t === 'none') return 'Offline';
+    return 'Not known (check that you’re on Wi-Fi)';
+  }
+
+  async function freeSpace() {
+    try {
+      const e = navigator.storage && navigator.storage.estimate ? await navigator.storage.estimate() : null;
+      return e && e.quota ? Math.max(0, e.quota - (e.usage || 0)) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // The one-time download, asked first: what it is, its size, the connection, the free space.
+  async function askDownload(id) {
+    let V;
+    try {
+      V = await voiceModule();
+    } catch (e) {
+      toast('Couldn’t load the voice list. Check your connection.');
+      return;
+    }
+    const entry = V.findVoice(id);
+    if (!entry) return;
+    if (au.dl) {
+      toast(au.dl.id === id ? `${entry.name} is downloading.` : 'Another voice is downloading. Wait for it to finish.');
+      return;
+    }
+    if (entry.engine === 'kokoro' && !(await hasWebGpu())) {
+      const std = kitVoiceId('standard');
+      toast(`${entry.name} needs WebGPU, which this browser doesn’t have. The standard voice works here.`, { action: 'Get it', onAction: () => askDownload(std) });
+      return;
+    }
+    if (!playerSupported()) {
+      toast('This browser can’t play downloaded voices. Readout uses the device voice here.');
+      return;
+    }
+    let st = { total: entry.bytes, bytes: 0 };
+    try {
+      st = await V.voiceStore.status(id);
+    } catch (e) {
+      /* no OPFS: install() will say so */
+    }
+    const need = Math.max(0, st.total - st.bytes);
+    const free = await freeSpace();
+    const acc = ACCENT_NAME[entry.dialect] || '';
+    el.voiceSheetTitle.textContent = `Download ${entry.name}?`;
+    el.voiceSheetWhat.textContent =
+      entry.engine === 'kokoro'
+        ? `${entry.name} is a natural-sounding ${acc} voice. It runs on this device (on its graphics chip), works offline, and keeps reading with the screen off.`
+        : `${entry.name} is a standard ${acc} voice that works on any phone, offline and with the screen off.`;
+    el.voiceSheetSize.textContent = need < st.total - 1000 ? `${fmtMB(need)} more (${fmtMB(st.total)} in all)` : fmtMB(need);
+    const net = netText();
+    el.voiceSheetNet.textContent = net;
+    el.voiceSheetSpace.textContent = free == null ? 'Not known' : free >= 1e9 ? `${(free / 1e9).toFixed(1)} GB` : fmtMB(free);
+    const notes = [];
+    if (free != null && free < need * 1.05) notes.push('There isn’t enough free space for this voice. Free up some space and try again.');
+    else if (net === 'Mobile data') notes.push(`You’re on mobile data: this uses about ${fmtMB(need)} of it. On Wi-Fi it costs nothing.`);
+    else if (net === 'Offline') notes.push('You’re offline. Connect to the internet to download.');
+    notes.push('It downloads once and stays on this device. If the download stops, it picks up where it left off.');
+    if (entry.license) notes.push(`Voice licence: ${entry.license}.`);
+    el.voiceSheetNote.textContent = notes.join(' ');
+    el.voiceSheetYes.disabled = (free != null && free < need * 1.05) || net === 'Offline';
+    el.voiceSheetYes.onclick = () => {
+      closeSheet(el.voiceSheet);
+      downloadVoice(id);
+    };
+    openSheet(el.voiceSheet);
+  }
+
+  async function downloadVoice(id) {
+    const V = await voiceModule();
+    const entry = V.findVoice(id);
+    if (au.dl) return;
+    const ctrl = new AbortController();
+    au.dl = { id, ctrl, done: 0, total: entry.bytes };
+    renderVoicePanel();
+    renderVoiceList();
+    toast(`Downloading ${entry.name}. You can keep reading with the device voice meanwhile.`);
+    wake.want('download', true);
+    let ok = false;
+    try {
+      await V.voiceStore.install(id, {
+        signal: ctrl.signal,
+        onProgress: (p) => {
+          if (!au.dl || au.dl.id !== id) return;
+          au.dl.done = p.done || 0;
+          au.dl.total = p.total || au.dl.total;
+          renderDownloadProgress();
+        },
+      });
+      ok = true;
+    } catch (e) {
+      if (isAbort(e)) toast('Download stopped. Next time it picks up where it left off.');
+      else if (e && (e.code === 'quota' || e.name === 'QuotaExceededError')) toast('There isn’t enough free space on this device for that voice.');
+      else {
+        console.warn('Readout voice download', e);
+        toast(navigator.onLine === false ? 'The download stopped: you’re offline. It picks up where it left off next time.' : 'The download stopped. Tap Download to pick up where it left off.');
+      }
+    } finally {
+      au.dl = null;
+      wake.want('download', false);
+    }
+    await refreshVoices();
+    if (!ok) return;
+    const eng = chooseEngine();
+    if (eng.kind === 'audio' && eng.id === id) {
+      toast(`${entry.name} is ready.${tts.playing ? '' : ' Press play to listen.'}`);
+      // Reading with the device voice now: carry on with the new voice from here.
+      if (tts.playing && tts.engine === 'device') {
+        const i = state.idx;
+        pausePlayback();
+        play(i);
+      } else warmVoiceSoon();
+    } else toast(`${entry.name} is downloaded.`);
+  }
+
+  function stopDownload() {
+    if (au.dl) au.dl.ctrl.abort();
+  }
+
+  async function removeVoice(id, btn) {
+    if (btn && btn.dataset.confirm !== '1') {
+      btn.dataset.confirm = '1';
+      btn.textContent = 'Tap again to remove';
+      setTimeout(() => {
+        btn.dataset.confirm = '';
+        btn.textContent = 'Remove';
+      }, 4000);
+      return;
+    }
+    const V = await voiceModule();
+    if (au.dl && au.dl.id === id) {
+      au.dl.ctrl.abort();
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    if (au.voice && au.voice.id === id) {
+      pausePlayback();
+      dropPlayer();
+      stopPreview();
+      au.voice.dispose();
+      au.voice = null;
+    }
+    try {
+      await V.voiceStore.remove(id);
+      toast(`Removed ${V.findVoice(id).name} from this device.`);
+    } catch (e) {
+      toast('Couldn’t remove that voice.');
+    }
+    au.installed.delete(id);
+    await refreshVoices();
+  }
+
+  // Something to try once with the device voice: a voice that keeps reading with the screen off.
+  function offerVoiceOnce() {
+    const s = state.settings;
+    if (s.offeredVoice || au.offerShown || s.voiceMode === 'device' || !playerSupported() || au.installed.size || au.dl) return;
+    au.offerShown = true;
+    setTimeout(() => {
+      if (au.installed.size || au.dl) return;
+      s.offeredVoice = true;
+      saveSettings();
+      const id = kitVoiceId(s.voiceMode);
+      const size = s.voiceMode === 'natural' ? '326 MB' : '63 MB';
+      toast(`For a natural voice that keeps reading with the screen off, download ${voiceName(id) === 'The voice' ? 'one' : voiceName(id)} (${size}, once).`, { action: 'Download', onAction: () => askDownload(id) });
+    }, 2500);
+  }
+
+  async function setVoiceMode(m) {
+    if (!MODE_NAME[m] || m === state.settings.voiceMode) return;
+    state.settings.voiceMode = m;
+    saveSettings();
+    au.broken = false;
+    au.naturalBroken = false;
+    switchEngineNow();
+    renderRate();
+    renderVoicePanel();
+    if (m !== 'device') {
+      await refreshVoices();
+      const id = kitVoiceId(m);
+      if (!au.installed.has(id) && !(au.dl && au.dl.id === id) && !(m === 'natural' && naturalFails())) askDownload(id);
+    }
+  }
+
+  function setAccent(a) {
+    if (a !== 'en-US' && a !== 'en-GB') return;
+    if (a === accent() && state.settings.accent) return;
+    state.settings.accent = a;
+    saveSettings();
+    replanCurrent(); // US and UK read dates, numbers and spellings differently
+    renderVoicePanel();
+    const m = state.settings.voiceMode;
+    if (m !== 'device') {
+      const id = kitVoiceId(m);
+      if (!au.installed.has(id) && !au.dl && !(m === 'natural' && naturalFails())) askDownload(id);
+    }
+  }
+
+  function setSpeaker(id) {
+    const m = state.settings.voiceMode;
+    if (m === 'device') return;
+    const key = `${m}-${accent()}`;
+    if (!(KIT_VOICES[key] || []).includes(id)) return;
+    state.settings.voices = Object.assign({}, state.settings.voices, { [key]: id });
+    saveSettings();
+    switchEngineNow();
+    renderVoicePanel();
+    if (!au.installed.has(id) && !au.dl) askDownload(id);
+  }
+
+  // A different voice was chosen while reading: go on from here with it.
+  function switchEngineNow() {
+    const eng = chooseEngine();
+    const same = eng.kind === 'device' ? tts.engine === 'device' : tts.engine === 'audio' && au.voice && au.voice.id === eng.id && !!au.player;
+    if (same) return;
+    if (tts.playing) {
+      const i = state.idx;
+      pausePlayback();
+      dropPlayer();
+      play(i);
+    } else {
+      dropPlayer();
+      warmVoiceSoon();
+    }
+  }
+
+  function checkNaturalAgain() {
+    recordNaturalCheck(null);
+    au.gpu = null;
+    au.broken = false;
+    au.naturalBroken = false;
+    renderVoicePanel();
+    const id = kitVoiceId('natural');
+    if (!au.installed.has(id)) {
+      askDownload(id);
+      return;
+    }
+    if (au.voice && au.voice.id === id) {
+      pausePlayback();
+      dropPlayer();
+      stopPreview();
+      au.voice.dispose();
+      au.voice = null;
+    }
+    ensureVoice(id)
+      .then(() => {
+        toast(`${voiceName(id)} works on this device.`);
+        renderVoicePanel();
+      })
+      .catch((e) => {
+        if (!isAbort(e)) audioFailed(e, { id });
+      });
+  }
+
+  // The voice part of the speed sheet: mode, accent, speaker, and what's downloaded.
+  function renderVoicePanel() {
+    if (!el.vmodeGroup) return;
+    const s = state.settings;
+    const mode = s.voiceMode;
+    const acc = accent();
+    for (const i of el.vmodeGroup.querySelectorAll('input')) i.checked = i.value === mode;
+    for (const i of el.accentGroup.querySelectorAll('input')) i.checked = i.value === acc;
+    const device = mode === 'device';
+    el.kitVoiceSelect.hidden = device;
+    el.voiceSelect.hidden = !device;
+    el.pitchField.hidden = !device;
+    el.voiceBar.hidden = true;
+    for (const b of [el.voiceGetBtn, el.voiceStopBtn, el.voiceRetryBtn]) b.hidden = true;
+    if (device) {
+      renderVoiceOptions();
+      return;
+    }
+    const V = kit.V;
+    if (!V) {
+      el.voiceHint.textContent = 'Loading the voices…';
+      voiceModule().then(refreshVoices, () => (el.voiceHint.textContent = 'Couldn’t load the voice list.'));
+      return;
+    }
+    const key = `${mode}-${acc}`;
+    const id = kitVoiceId(mode);
+    const opts = (KIT_VOICES[key] || []).map((vid) => {
+      const v = V.findVoice(vid);
+      const o = document.createElement('option');
+      o.value = vid;
+      o.textContent = `${v.name} (${v.gender === 'female' ? 'female' : 'male'})${au.installed.has(vid) ? '' : ', not downloaded'}`;
+      return o;
+    });
+    el.kitVoiceSelect.replaceChildren(...opts);
+    el.kitVoiceSelect.value = id;
+    const entry = V.findVoice(id);
+    const info = voiceInfo.get(id) || { need: entry.bytes, total: entry.bytes };
+    const eng = chooseEngine();
+    const using = eng.kind === 'audio' ? `${voiceName(eng.id)} (${eng.mode})` : 'the device voice';
+    let hint;
+    if (!playerSupported()) hint = 'This browser can’t play downloaded voices, so Readout uses the device voice.';
+    else if (au.dl && au.dl.id === id) {
+      hint = downloadText();
+      el.voiceBar.hidden = false;
+      el.voiceStopBtn.hidden = false;
+    } else if (mode === 'natural' && naturalFails()) {
+      const c = naturalCheck();
+      const why = au.gpu === false || (c && c.reason === 'webgpu') ? 'this browser has no WebGPU' : c && c.reason === 'slow' ? 'it’s too slow here' : 'its sound came out wrong here';
+      hint = `${entry.name} doesn’t run well on this device (${why}). Readout uses ${using}.`;
+      el.voiceRetryBtn.hidden = false;
+      const std = kitVoiceId('standard');
+      if (!au.installed.has(std)) {
+        el.voiceGetBtn.hidden = false;
+        el.voiceGetLabel.textContent = `Get the standard voice (${fmtMB((voiceInfo.get(std) || {}).need || 63.2 * MB)})`;
+        el.voiceGetBtn.dataset.id = std;
+      }
+    } else if (au.installed.has(id)) {
+      hint = eng.kind === 'audio' && eng.id === id ? `${entry.name} is on this device and keeps reading with the screen off.` : `${entry.name} is downloaded.`;
+    } else {
+      hint = info.partial ? `${entry.name}: ${fmtMB(info.bytes)} of ${fmtMB(info.total)} downloaded.` : `${entry.name} isn’t downloaded yet.`;
+      hint += ` Until then Readout uses ${using}.`;
+      el.voiceGetBtn.hidden = !!au.dl;
+      el.voiceGetLabel.textContent = info.partial ? 'Resume download' : `Download (${fmtMB(info.need)})`;
+      el.voiceGetBtn.dataset.id = id;
+    }
+    el.voiceHint.textContent = hint;
+    renderDownloadProgress();
+  }
+
+  function downloadText() {
+    const d = au.dl;
+    if (!d) return '';
+    return `Downloading ${voiceName(d.id)}: ${fmtMB(d.done)} of ${fmtMB(d.total)} (${Math.floor(d.total ? (d.done / d.total) * 100 : 0)}%)`;
+  }
+
+  let dlRender = 0;
+  function renderDownloadProgress() {
+    const d = au.dl;
+    if (!d) return;
+    const now = Date.now();
+    if (now - dlRender < 250 && d.done < d.total) return;
+    dlRender = now;
+    const pct = d.total ? Math.min(100, (d.done / d.total) * 100) : 0;
+    if (!el.voiceBar.hidden) {
+      el.voiceBarFill.style.width = pct + '%';
+      el.voiceHint.textContent = downloadText();
+    }
+    const row = el.voiceList && el.voiceList.querySelector(`[data-dl="${d.id}"]`);
+    if (row) row.textContent = `Downloading: ${Math.floor(pct)}%`;
+  }
+
+  // Settings: the voices on this device, each with Remove.
+  function renderVoiceList() {
+    if (!el.voiceList || !kit.V) return;
+    const V = kit.V;
+    const rows = [];
+    const kokoroCount = allKitVoices().filter((id) => au.installed.has(id) && V.findVoice(id).engine === 'kokoro').length;
+    for (const id of allKitVoices()) {
+      const info = voiceInfo.get(id);
+      const downloading = au.dl && au.dl.id === id;
+      if (!downloading && !(info && (info.installed || info.partial))) continue;
+      const v = V.findVoice(id);
+      const li = document.createElement('li');
+      const name = document.createElement('span');
+      name.className = 'vl-name';
+      name.textContent = v.name;
+      const meta = document.createElement('span');
+      meta.className = 'vl-meta';
+      const kind = `${v.engine === 'kokoro' ? 'Natural' : 'Standard'}, ${ACCENT_NAME[v.dialect]}`;
+      if (downloading) {
+        meta.dataset.dl = id;
+        meta.textContent = 'Downloading';
+      } else if (info.installed) meta.textContent = `${kind}, ${v.engine === 'kokoro' && kokoroCount > 1 ? '0.5 MB (shares the natural voice model)' : fmtMB(info.total)}`;
+      else meta.textContent = `${kind}, ${fmtMB(info.bytes)} of ${fmtMB(info.total)} downloaded`;
+      name.appendChild(meta);
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'btn btn-sm';
+      b.textContent = downloading ? 'Stop' : 'Remove';
+      b.addEventListener('click', () => (downloading ? stopDownload() : removeVoice(id, b)));
+      li.append(name, b);
+      rows.push(li);
+    }
+    if (!rows.length) {
+      const li = document.createElement('li');
+      li.className = 'empty';
+      li.textContent = 'No voices downloaded yet. Pick Natural or Standard under Speed and voice.';
+      rows.push(li);
+    }
+    el.voiceList.replaceChildren(...rows);
+    renderDownloadProgress();
   }
 
   /* ================= dictation ================= */
@@ -1605,214 +2705,41 @@
     play(0);
   }
 
-  let pdfjsPromise = null;
-  function loadPdfjs() {
-    if (!pdfjsPromise) {
-      pdfjsPromise = import(CONFIG.pdfjsBase + 'pdf.min.mjs')
-        .then((lib) => {
-          lib.GlobalWorkerOptions.workerSrc = CONFIG.pdfjsBase + 'pdf.worker.min.mjs';
-          return lib;
-        })
-        .catch((e) => {
-          pdfjsPromise = null;
-          throw e;
-        });
-    }
-    return pdfjsPromise;
-  }
 
-  function pageText(items) {
-    const lines = [];
-    let line = '';
-    let lastY = null;
-    let lastH = 10;
-    for (const it of items) {
-      if (typeof it.str !== 'string') continue;
-      const y = it.transform ? it.transform[5] : null;
-      const h = it.height || lastH;
-      if (lastY !== null && y !== null && it.str && Math.abs(y - lastY) > h * 0.5) {
-        if (line.trim()) lines.push(line);
-        line = '';
-        if (Math.abs(y - lastY) > h * 1.9) lines.push('');
-      }
-      line += it.str;
-      if (it.str) {
-        lastY = y;
-        lastH = h || lastH;
-      }
-      if (it.hasEOL) {
-        if (line.trim()) lines.push(line);
-        line = '';
-      }
-    }
-    if (line.trim()) lines.push(line);
-    return lines
-      .map((l) => l.replace(/\s+/g, ' ').trim())
-      .join('\n')
-      .replace(/\n{3,}/g, '\n\n');
-  }
+  /* ---------- opening files (readkit extract) ---------- */
 
-  function userError(message) {
-    return Object.assign(new Error(message), { user: message });
-  }
-
+  // PDFs (scans too, with or without the scanner's hidden text layer), photos and
+  // screenshots, Word, OpenDocument, PowerPoint, EPUB, RTF, web pages, Markdown and text all
+  // become one Doc; its text without running heads, page numbers, footnotes and margin notes
+  // (unless Settings keeps those notes) is what Readout stores.
   let fileNote = ''; // replaces the usual "Ready" message after opening a file
 
-  async function pdfToText(file) {
-    toast('Reading the PDF…');
-    const lib = await loadPdfjs();
-    let pdf;
-    try {
-      // wasmUrl lets pdf.js decode JPEG 2000 page images, which many scanned PDFs use.
-      pdf = await lib.getDocument({ data: new Uint8Array(await file.arrayBuffer()), wasmUrl: CONFIG.pdfjsWasm }).promise;
-    } catch (e) {
-      if (e && e.name === 'PasswordException') throw userError(`“${file.name}” is password-protected, so Readout can’t open it.`);
-      throw e;
-    }
-    try {
-      const n = pdf.numPages;
-      const pages = [];
-      for (let p = 1; p <= n; p++) {
-        if (n > 4 && p % 5 === 0) toast(`Reading the PDF, page ${p} of ${n}…`);
-        const page = await pdf.getPage(p);
-        const content = await page.getTextContent();
-        pages.push(pageText(content.items));
-        if (page.cleanup) page.cleanup();
-      }
-      // A scanned PDF has no text, only pictures of pages (sometimes with a repeated
-      // stamp or header, so look after removing those). A few sparse pages are
-      // usually covers, blank pages, or figures; many picture pages mean a scan.
-      const sparse = [];
-      Core.stripRepeats(pages).forEach((t, i) => Core.letterCount(t) < 40 && sparse.push(i + 1));
-      const need = Math.max(1, Math.ceil(n * 0.3));
-      const pictures = sparse.length >= need ? await picturePages(lib, pdf, sparse, need) : [];
-      if (pictures.length && (await askOcr(`“${file.name}” is scanned pages`))) {
-        try {
-          await ocrPdfPages(pdf, pictures, pages);
-        } catch (e) {
-          console.warn('Readout OCR error', e);
-          if (!pages.some((t) => Core.letterCount(t) >= 40)) throw e;
-          fileNote = 'Couldn’t read the pictures in this PDF, so only its text is here.';
-        }
-      }
-      return Core.reflow(Core.stripRepeats(pages).join('\n\n'));
-    } finally {
-      try {
-        await pdf.destroy();
-      } catch (e) {
-        /* ignore */
-      }
-    }
+  const isPictureFile = (f) => /^image\//.test(f.type || '') || /\.(png|jpe?g|jfif|webp|gif|bmp|avif|heic)$/i.test(f.name || '');
+
+  function textFromDoc(doc) {
+    const notes = state.settings.includeNotes ? new Set(['margin', 'footnote']) : null;
+    const blocks = (doc.blocks || []).filter((b) => b && b.text && (!b.skip || (notes && notes.has(b.skip))));
+    return kit.K.docToText(blocks, { keepSkipped: true });
   }
 
-  // Of the sparse pages, the ones worth reading as pictures: those that draw an image.
-  // Checking means decoding the page, so once enough images are found to call the
-  // PDF a scan, the rest are assumed to be pictures too (blank ones just come back empty).
-  async function picturePages(lib, pdf, sparse, need) {
-    const IMAGE_OPS = new Set(
-      ['paintImageXObject', 'paintInlineImageXObject', 'paintImageMaskXObject', 'paintImageXObjectRepeat', 'paintInlineImageXObjectGroup', 'paintImageMaskXObjectGroup', 'paintImageMaskXObjectRepeat']
-        .map((k) => lib.OPS && lib.OPS[k])
-        .filter((v) => v !== undefined)
-    );
-    const out = [];
-    let found = 0;
-    for (let i = 0; i < sparse.length; i++) {
-      if (found >= need) {
-        out.push(...sparse.slice(i));
-        break;
-      }
-      const page = await pdf.getPage(sparse[i]);
-      let image = true;
-      try {
-        const ops = await page.getOperatorList();
-        image = ops.fnArray.some((f) => IMAGE_OPS.has(f));
-      } catch (e) {
-        /* can't tell: try reading it */
-      }
-      if (page.cleanup) page.cleanup();
-      if (image) {
-        found++;
-        out.push(sparse[i]);
-      }
-    }
-    return found >= need ? out : [];
+  // The file's own name, unless a camera, phone or scanner made it up ("IMG_2031.jpg",
+  // "scan0001.pdf"): then the title readkit found inside.
+  function fileTitle(name, docTitle) {
+    const base = String(name || '')
+      .replace(/^.*[\\/]/, '')
+      .replace(/\.[^.]+$/, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (base && !(kit.autoName && kit.autoName(name))) return base;
+    return String(docTitle || '').replace(/\s+/g, ' ').trim().slice(0, 120) || base;
   }
 
-  /* ================= reading text in pictures ================= */
-
-  // Scanned pages and photos are pictures with no text. Tesseract finds the words
-  // on this device. It loads on first use, about 5 MB, and is cached after that.
-  let ocrLibPromise = null;
-  function loadOcr() {
-    if (!ocrLibPromise) {
-      ocrLibPromise = new Promise((resolve, reject) => {
-        if (window.Tesseract) {
-          resolve(window.Tesseract);
-          return;
-        }
-        const s = document.createElement('script');
-        s.src = CONFIG.ocrScript;
-        s.crossOrigin = 'anonymous';
-        s.onload = () => (window.Tesseract ? resolve(window.Tesseract) : reject(new Error('Tesseract missing')));
-        s.onerror = () => reject(new Error('Tesseract failed to load'));
-        document.head.appendChild(s);
-      }).catch((e) => {
-        ocrLibPromise = null;
-        throw e;
-      });
-    }
-    return ocrLibPromise;
-  }
-
-  // Tesseract's own promise never settles if its files fail to download, so
-  // failures and long stalls are caught here instead.
-  async function startOcr() {
-    toast('Getting ready to read the pictures…', { sticky: true });
-    const lib = await loadOcr();
-    return new Promise((resolve, reject) => {
-      let done = false;
-      let stall = null;
-      const fail = (e) => {
-        if (done) return;
-        done = true;
-        clearTimeout(stall);
-        reject(e instanceof Error ? e : new Error(String(e)));
-      };
-      const alive = () => {
-        clearTimeout(stall);
-        if (!done) stall = setTimeout(() => fail(new Error('OCR setup stalled')), CONFIG.ocrStall);
-      };
-      alive();
-      lib
-        .createWorker(CONFIG.ocrLang, 1, {
-          workerPath: CONFIG.ocrWorker,
-          corePath: CONFIG.ocrCore,
-          langPath: CONFIG.ocrLangPath,
-          errorHandler: fail,
-          logger: (m) => {
-            alive();
-            if (!done && m && /^loading/.test(m.status) && m.progress > 0 && m.progress < 1) {
-              toast(`Getting ready to read the pictures… ${Math.round(m.progress * 100)}%`, { sticky: true });
-            }
-          },
-        })
-        .then((worker) => {
-          if (done) {
-            worker.terminate().catch(() => {});
-            return;
-          }
-          done = true;
-          clearTimeout(stall);
-          resolve(worker);
-        }, fail);
-    });
-  }
-
-  // Asks once before the first download; after a yes, scanned files just open.
-  function askOcr(what) {
+  // Asks once before the first OCR download; after a yes, scanned files just open.
+  function askOcr(what, bytes) {
     if (state.settings.ocrOk) return Promise.resolve(true);
     hideToast();
     el.ocrWhat.textContent = what;
+    el.ocrSize.textContent = fmtMB(bytes || 7 * MB);
     openSheet(el.ocrSheet);
     return new Promise((resolve) => {
       const finish = (ok) => {
@@ -1832,94 +2759,22 @@
     });
   }
 
-  function ocrProgress(job, i, n) {
-    toast(n > 1 ? `Reading the text in page ${i} of ${n}…` : 'Reading the text in the picture…', {
-      sticky: true,
-      action: n > 1 ? 'Stop' : '',
-      onAction: () => (job.stop = true),
-    });
-  }
-
-  // Draws a PDF page about 2000 px wide, sharp enough for the text to be read.
-  async function renderPage(page) {
-    const base = page.getViewport({ scale: 1 });
-    const viewport = page.getViewport({ scale: Core.clamp(2000 / base.width, 1, 4) });
-    const canvas = document.createElement('canvas');
-    canvas.width = Math.ceil(viewport.width);
-    canvas.height = Math.ceil(viewport.height);
-    const ctx = canvas.getContext('2d');
-    ctx.fillStyle = '#fff';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    await page.render({ canvasContext: ctx, viewport, background: 'white' }).promise;
-    return canvas;
-  }
-
-  // Reads the picture pages in order. A failure part way keeps the pages read so
-  // far; it only counts as an error if nothing could be read at all. Long jobs keep
-  // the screen on, since a locked phone pauses the page.
-  async function ocrPdfPages(pdf, list, pages) {
-    const job = { stop: false };
-    let worker = null;
-    let read = 0;
-    wake.want('ocr', true);
-    try {
-      worker = await startOcr();
-      for (let i = 0; i < list.length && !job.stop; i++) {
-        ocrProgress(job, i + 1, list.length);
-        const k = list[i] - 1;
-        try {
-          const page = await pdf.getPage(list[i]);
-          const canvas = await renderPage(page);
-          const { data } = await worker.recognize(canvas);
-          canvas.width = canvas.height = 0;
-          if (page.cleanup) page.cleanup();
-          const text = Core.cleanOcr(data.text);
-          if (Core.letterCount(text) > Core.letterCount(pages[k])) pages[k] = text; // keep a page's own text if it was better
-          read++;
-        } catch (e) {
-          if (!read) throw e;
-          console.warn('Readout OCR stopped at page', list[i], e);
-          break;
-        }
-      }
-    } finally {
-      if (worker) worker.terminate().catch(() => {});
-      wake.want('ocr', false);
-      hideToast();
+  // Progress in the toast, with Stop.
+  function fileProgress(job, p, name) {
+    if (job.ctrl.signal.aborted || el.ocrSheet.open) return;
+    const page = /scanned page (\d+)/.exec((p && p.message) || '');
+    if (page) {
+      job.ocrIndex = (p.done || 0) + 1;
+      job.ocrPages = p.total || 0;
     }
-  }
-
-  // Photos of pages: decoded by the browser (so phone photos come out the right
-  // way up) and scaled to about 12 megapixels, which reads well and quickly.
-  // Long screenshots keep their width, since the limit is on area.
-  async function imageToText(file) {
-    if (!(await askOcr(`“${file.name}” is a picture`))) return '';
-    let bmp;
-    try {
-      bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
-    } catch (e) {
-      throw userError(`Readout can’t open “${file.name}”. Try a JPEG or PNG photo.`);
-    }
-    const scale = Math.min(1, Math.sqrt(12e6 / (bmp.width * bmp.height)), 16000 / Math.max(bmp.width, bmp.height));
-    const canvas = document.createElement('canvas');
-    canvas.width = Math.max(1, Math.round(bmp.width * scale));
-    canvas.height = Math.max(1, Math.round(bmp.height * scale));
-    canvas.getContext('2d').drawImage(bmp, 0, 0, canvas.width, canvas.height);
-    if (bmp.close) bmp.close();
-    const job = { stop: false };
-    let worker = null;
-    wake.want('ocr', true);
-    try {
-      worker = await startOcr();
-      ocrProgress(job, 1, 1);
-      const { data } = await worker.recognize(canvas);
-      return Core.reflow(Core.cleanOcr(data.text));
-    } finally {
-      canvas.width = canvas.height = 0;
-      if (worker) worker.terminate().catch(() => {});
-      wake.want('ocr', false);
-      hideToast();
-    }
+    let msg;
+    if (p.stage === 'ocr-load' || p.stage === 'load' || p.stage === 'download') msg = 'Getting ready to read the pictures…';
+    else if (p.stage === 'ocr' || p.stage === 'parse') {
+      if (job.ocrPages > 1) msg = `Reading the text in page ${Math.min(job.ocrIndex, job.ocrPages)} of ${job.ocrPages}…`;
+      else msg = job.picture ? 'Reading the text in the picture…' : 'Reading the text in the page…';
+    } else if (p.stage === 'pdf' && p.total > 4 && p.done < p.total) msg = `Reading the PDF, page ${p.done + 1} of ${p.total}…`;
+    else msg = `Opening “${name}”…`;
+    toast(msg, { sticky: true, action: 'Stop', onAction: () => job.ctrl.abort() });
   }
 
   async function handleFiles(fileList) {
@@ -1927,23 +2782,66 @@
     el.fileInput.value = '';
     fileNote = '';
     if (!files.length) return;
+    if (!kit.K) {
+      toast('Readout is still starting. Try again in a moment.');
+      return;
+    }
     let last = null;
     let added = 0;
     for (const f of files) {
+      const job = { ctrl: new AbortController(), picture: isPictureFile(f), asked: false, declined: false, ocrIndex: 0, ocrPages: 0 };
+      const blocks = [];
+      let doc = null;
+      let stopped = false;
+      wake.want('file', true); // a locked phone pauses the page
       try {
-        const isPdf = f.type === 'application/pdf' || /\.pdf$/i.test(f.name);
-        const isImage = /^image\//.test(f.type) || /\.(png|jpe?g|webp|gif|bmp)$/i.test(f.name);
-        const text = isPdf ? await pdfToText(f) : isImage ? await imageToText(f) : Core.normalizeText(await f.text());
-        if (!text.trim()) {
-          toast(isPdf || isImage ? `No text to read in “${f.name}”.` : `“${f.name}” is empty.`);
+        toast(`Opening “${f.name}”…`, { sticky: true, action: 'Stop', onAction: () => job.ctrl.abort() });
+        try {
+          doc = await kit.K.extract(f, {
+            name: f.name,
+            dialect: accent(),
+            signal: job.ctrl.signal,
+            allowOcr: async ({ bytes }) => {
+              job.asked = true;
+              const ok = await askOcr(job.picture ? `“${f.name}” is a picture` : `“${f.name}” is scanned pages`, bytes);
+              job.declined = !ok;
+              if (ok) fileProgress(job, { stage: 'ocr-load' }, f.name);
+              return ok;
+            },
+            onProgress: (p) => p && fileProgress(job, p, f.name),
+            onBlock: (b) => blocks.push(b),
+          });
+        } catch (e) {
+          if (!isAbort(e)) throw e;
+          // Stop keeps what was read so far.
+          stopped = true;
+          doc = { blocks, warnings: [], title: '' };
+        }
+        hideToast();
+        const text = Core.normalizeText(textFromDoc(doc)).trim();
+        const warnings = doc.warnings || [];
+        if (!text) {
+          const w = warnings.find((x) => x.type === 'unsupported' || x.type === 'drm');
+          const ocrFailed = job.asked && !job.declined && warnings.some((x) => x.type === 'ocr-unavailable');
+          toast(
+            stopped
+              ? `Stopped before any text of “${f.name}” was read.`
+              : w
+                ? w.text
+                : ocrFailed
+                  ? `Couldn’t read the pictures in “${f.name}”.${navigator.onLine === false ? ' Reading pictures needs a connection the first time.' : ''}`
+                  : `No text to read in “${f.name}”.`
+          );
           continue;
         }
-        const title = f.name.replace(/\.[^.]+$/, '');
+        if (stopped) fileNote = 'Stopped. The pages read so far are here.';
+        else if (!job.declined && warnings.some((w) => w.type === 'ocr-unavailable')) fileNote = 'Couldn’t read the pictures in this PDF, so only its text is here.';
+        const title = fileTitle(f.name, doc.title);
         const cur = state.current;
         if (cur && files.length === 1 && !cur.text.trim()) {
           cur.text = text;
-          cur.title = title;
-          cur.titleLocked = true;
+          cur.title = title || Core.deriveTitle(text);
+          cur.titleLocked = !!title;
           cur.updatedAt = cur.titleAt = Date.now();
           touch(cur, true);
           scheduleSave(cur);
@@ -1956,6 +2854,8 @@
         console.warn('Readout file error', e);
         hideToast();
         toast(e && e.user ? e.user : `Couldn’t open “${f.name}”.${navigator.onLine === false ? ' Opening a PDF or picture needs a connection the first time.' : ''}`);
+      } finally {
+        wake.want('file', false);
       }
     }
     if (last) {
@@ -1964,6 +2864,46 @@
       closeDrawer();
       toast(added > 1 ? `Added ${added} files.` : fileNote || 'Ready. Press play to listen.');
     }
+  }
+
+  /* ---------- the Android share sheet ---------- */
+
+  function addSharedText(body, title) {
+    if (/^https?:\/\/\S+$/i.test(body)) {
+      toast('Readout got a link, not the page’s text. Select the text on the page and share that instead.');
+      return false;
+    }
+    const doc = createDoc(Core.normalizeText(body), title && title !== body ? title : '');
+    openDoc(doc.id, { mode: 'listen' });
+    toast('Added. Press play to listen.');
+    return true;
+  }
+
+  // Files and text shared to Readout: sw.js kept them in Cache Storage and opened ./?shared=1.
+  async function openShared() {
+    try {
+      const cache = await caches.open('readout-share');
+      const res = await cache.match(new URL('shared/meta.json', location.href).href);
+      const meta = res ? await res.json() : null;
+      const files = [];
+      for (const f of (meta && meta.files) || []) {
+        const r = await cache.match(f.key);
+        if (r) files.push(new File([await r.blob()], f.name, { type: f.type || r.headers.get('Content-Type') || '' }));
+      }
+      for (const k of await cache.keys()) await cache.delete(k);
+      if (files.length) {
+        await handleFiles(files);
+        return;
+      }
+      const body = ((meta && meta.text) || '').trim() || ((meta && meta.url) || '').trim();
+      if (body) {
+        addSharedText(body, ((meta && meta.title) || '').trim());
+        return;
+      }
+    } catch (e) {
+      console.warn('Readout: reading what was shared', e);
+    }
+    toast('Nothing came through from the share. Try sharing again.');
   }
 
   /* ================= more menu: copy, share, export ================= */
@@ -2008,7 +2948,7 @@
   }
 
   function download(filename, text, type) {
-    const blob = new Blob([text], { type: type || 'text/plain;charset=utf-8' });
+    const blob = typeof Blob !== 'undefined' && text instanceof Blob ? text : new Blob([text], { type: type || 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -2054,11 +2994,14 @@
       download(fileName(doc.title, 'md'), body, 'text/markdown;charset=utf-8');
     } else if (act === 'reflow') {
       reflowDoc(doc);
+    } else if (act === 'chapters') {
+      openChapters();
+    } else if (act === 'audio') {
+      saveAudio(doc);
     } else if (act === 'restart') {
       pausePlayback();
-      state.idx = 0;
-      tts.wordOffset = 0;
       if (state.mode !== 'listen') setMode('listen');
+      seekTo(0);
       highlightChunk(0, { scroll: false });
       el.stage.scrollTo({ top: 0 });
       savePositionNow();
@@ -2071,6 +3014,50 @@
       toast(doc.pinned ? 'Pinned to the top.' : 'Unpinned.');
     } else if (act === 'delete') {
       deleteDoc(doc.id);
+    }
+  }
+
+  // Save audio: the text's audio as an Ogg file, from what the natural or standard voice has
+  // read aloud so far (readkit keeps each sentence it makes in a cache on this device).
+  async function saveAudio(doc) {
+    const eng = chooseEngine();
+    if (eng.kind !== 'audio') {
+      toast('Save audio works with the natural and standard voices. Pick one under Speed and voice.');
+      return;
+    }
+    if (!state.segs.length) return;
+    toast('Collecting the audio…', { sticky: true });
+    try {
+      const [V, P, C] = await Promise.all([voiceModule(), playerModule(), import('./readkit/src/audio/clipstore.js')]);
+      const entry = V.findVoice(eng.id);
+      const clips = C.openClipStore();
+      try {
+        const now = au.player && au.voice && au.voice.id === eng.id ? au.player.generatedSpeed : P.snapSpeed(audioRate());
+        const speeds = [...new Set([now, P.snapSpeed(audioRate()), 1, ...P.SPEEDS])];
+        let best = null;
+        for (const speed of speeds) {
+          const keys = await C.segmentKeys(state.segs, { engine: entry.engine, revision: entry.revision, voice: eng.id, speed });
+          let have = 0;
+          for (const k of keys) if (await clips.has(k)) have++;
+          if (!best || have > best.have) best = { speed, keys, have };
+          if (have === keys.length) break;
+        }
+        hideToast();
+        if (!best || !best.have) {
+          toast(`Nothing to save yet. Readout keeps the audio of what ${entry.name} has read aloud, so listen to this text first.`);
+          return;
+        }
+        const out = await clips.exportOgg(best.keys, { tags: { title: doc.title, artist: 'Readout' } });
+        download(fileName(doc.title, 'ogg'), out && out.blob ? out.blob : out);
+        const n = best.keys.length;
+        toast(best.have < n ? `Saved the audio of the ${best.have} of ${n} sentences read aloud so far.` : 'Saved the audio of the whole text.');
+      } finally {
+        clips.close();
+      }
+    } catch (e) {
+      console.warn('Readout: save audio', e);
+      hideToast();
+      toast('Couldn’t save the audio.');
     }
   }
 
@@ -2340,7 +3327,8 @@
     }
     sync.skipped = skipped;
     const now = Date.now();
-    const m = Core.mergeSync({ docs, positions: [...state.positions.values()], tombs: sync.tombs }, theirs, {
+    const prefs = state.settings.lexiconAt ? { lexicon: state.settings.lexicon, at: state.settings.lexiconAt } : null;
+    const m = Core.mergeSync({ docs, positions: [...state.positions.values()], tombs: sync.tombs, prefs }, theirs, {
       pruneBefore: now - TOMB_DAYS * 86400000,
       maxText: SYNC_MAX_TEXT,
     });
@@ -2404,14 +3392,26 @@
     }
     sync.tombs = m.tombs;
     saveTombs();
+    // The pronunciation list from another device.
+    let lexChanged = false;
+    if (m.prefs && m.prefs.at > (state.settings.lexiconAt || 0)) {
+      state.settings.lexicon = m.prefs.lexicon;
+      state.settings.lexiconAt = m.prefs.at;
+      saveSettings();
+      if (el.settingsSheet.open) renderLexicon();
+      lexChanged = true;
+    }
 
     if (curGone) {
       state.current = null;
       openNextOrWelcome();
       toast(`“${curGone.title}” was deleted on another device.`);
     } else if (cur && (curText || curMoved) && state.current === cur) {
-      if (curText) rebuildChunks();
-      if (!tts.playing) placeAtSaved(cur);
+      if (curText) rebuildSegments();
+      if (!tts.playing) {
+        placeAtSaved(cur);
+        if (au.player) dropPlayer(); // a paused player would resume at the old place
+      }
       if (state.mode === 'edit') {
         if (curText) {
           const ta = el.editor;
@@ -2426,6 +3426,7 @@
       }
       renderView();
     }
+    if (lexChanged && !tts.playing && state.current && !curGone) replanCurrent();
     if (changed) {
       renderTitle();
       renderLibrary();
@@ -2734,16 +3735,39 @@
   }
 
   function renderRate() {
+    const max = rateMax();
+    if (state.settings.rate > max) state.settings.rate = max;
     const r = state.settings.rate;
     el.speedLabel.textContent = fmtRate(r) + '×';
     el.rateReadout.textContent = r.toFixed(2) + '×';
+    if (el.rateSlider.max !== String(max) || !el.dialScale.childElementCount) {
+      el.rateSlider.max = String(max);
+      renderDialScale(max);
+    }
     if (document.activeElement !== el.rateSlider) el.rateSlider.value = String(r);
-    for (const b of el.rateChips.children) b.setAttribute('aria-pressed', String(Number(b.dataset.rate) === r));
+    for (const b of el.rateChips.children) {
+      b.setAttribute('aria-pressed', String(Number(b.dataset.rate) === r));
+      b.hidden = Number(b.dataset.rate) > max;
+    }
     el.slowerBtn.disabled = r <= 0.5;
-    el.fasterBtn.disabled = r >= 4;
+    el.fasterBtn.disabled = r >= max;
     const p = state.settings.pitch;
     if (document.activeElement !== el.pitchSlider) el.pitchSlider.value = String(p);
     el.pitchValue.textContent = Math.abs(p - 1) < 0.001 ? 'Normal' : p < 1 ? `Lower (${p.toFixed(2)})` : `Higher (${p.toFixed(2)})`;
+  }
+
+  // Tick labels under the speed dial: 0.5×, 1× and each whole speed up to the maximum.
+  function renderDialScale(max) {
+    const marks = [0.5, 1];
+    for (let x = 2; x <= max; x++) marks.push(x);
+    el.dialScale.replaceChildren(
+      ...marks.map((m) => {
+        const s = document.createElement('span');
+        s.textContent = fmtRate(m) + '×';
+        s.style.left = ((m - 0.5) / (max - 0.5)) * 100 + '%';
+        return s;
+      })
+    );
   }
 
   function buildRateChips() {
@@ -2758,6 +3782,7 @@
     el.rateChips.replaceChildren(...chips);
   }
 
+  // The device voices (Device mode).
   function renderVoiceOptions() {
     const sel = el.voiceSelect;
     if (!sel) return;
@@ -2802,13 +3827,11 @@
     sel.replaceChildren(frag);
     const uri = state.settings.voiceURI;
     sel.value = uri && voices.some((v) => v.voiceURI === uri) ? uri : '';
+    if (state.settings.voiceMode !== 'device') return;
     el.voiceHint.textContent = !tts.ok
       ? 'This browser has no speech voices. Open Readout in Chrome.'
-      : IS_ANDROID
-        ? 'For more or better voices, open your phone’s text-to-speech settings and install voice data for Google’s speech engine.'
-        : voices.length
-          ? ''
-          : 'Loading voices…';
+      : (IS_ANDROID ? 'For more or better device voices, open your phone’s text-to-speech settings and install voice data for Google’s speech engine. ' : voices.length ? '' : 'Loading voices… ') +
+        'The device voice needs the screen on; Natural and Standard keep reading with it off.';
   }
 
   function repoUrl() {
@@ -2820,15 +3843,18 @@
   }
 
   function renderSettings() {
-    for (const i of el.themeGroup.querySelectorAll('input')) i.checked = i.value === state.settings.theme;
-    for (const i of el.sizeGroup.querySelectorAll('input')) i.checked = i.value === state.settings.size;
-    el.followToggle.checked = !!state.settings.follow;
-    el.awakeToggle.checked = !!state.settings.keepAwake;
-    el.bgToggle.checked = !!state.settings.background;
-    el.punctToggle.checked = !!state.settings.spokenPunct;
-    el.localToggle.checked = !!state.settings.dictLocal;
+    const s = state.settings;
+    for (const i of el.themeGroup.querySelectorAll('input')) i.checked = i.value === s.theme;
+    for (const i of el.sizeGroup.querySelectorAll('input')) i.checked = i.value === s.size;
+    el.followToggle.checked = !!s.follow;
+    el.awakeToggle.checked = !!s.keepAwake;
+    el.autoNextToggle.checked = !!s.autoNext;
+    el.citeToggle.checked = s.skipCitations !== false;
+    el.notesToggle.checked = !!s.includeNotes;
+    el.punctToggle.checked = !!s.spokenPunct;
+    el.localToggle.checked = !!s.dictLocal;
     el.localToggleRow.hidden = !(SR && typeof SR.available === 'function');
-    el.dictLang.value = state.settings.dictLang || '';
+    el.dictLang.value = s.dictLang || '';
     const parts = [document.createTextNode(`Readout ${VERSION}. Works best in Chrome. `)];
     const url = repoUrl();
     if (url) {
@@ -2841,6 +3867,9 @@
     }
     if (store.memoryOnly) parts.push(document.createTextNode(' This browser isn’t allowing storage, so texts disappear when you close the page.'));
     el.about.replaceChildren(...parts);
+    renderLexicon();
+    renderVoiceList();
+    refreshVoices();
     renderSync();
   }
 
@@ -2861,6 +3890,88 @@
     root.dataset.size = state.settings.size;
     const dark = state.settings.theme === 'dark' || (state.settings.theme === 'system' && darkScheme.matches);
     if (el.themeColor) el.themeColor.setAttribute('content', dark ? '#131a2b' : '#f6f7f9');
+  }
+
+  /* ================= pronunciations ================= */
+
+  function renderLexicon() {
+    const list = Core.cleanLexicon(state.settings.lexicon);
+    const rows = list.map(([word, say]) => {
+      const li = document.createElement('li');
+      const t = document.createElement('span');
+      t.className = 'lx-text';
+      const w = document.createElement('b');
+      w.textContent = word;
+      const arrow = document.createElement('span');
+      arrow.className = 'lx-arrow';
+      arrow.textContent = '→';
+      t.append(w, arrow, document.createTextNode(say));
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'icon-btn';
+      b.setAttribute('aria-label', `Remove ${word}`);
+      b.appendChild(useIcon('close'));
+      b.addEventListener('click', () => setLexicon(list.filter((e) => e[0] !== word)));
+      li.append(t, b);
+      return li;
+    });
+    if (!rows.length) {
+      const li = document.createElement('li');
+      li.className = 'empty';
+      li.textContent = 'No pronunciations yet.';
+      rows.push(li);
+    }
+    el.lexList.replaceChildren(...rows);
+  }
+
+  function setLexicon(list) {
+    state.settings.lexicon = Core.cleanLexicon(list);
+    state.settings.lexiconAt = Date.now();
+    saveSettings();
+    renderLexicon();
+    replanCurrent();
+    syncSoon();
+  }
+
+  function addLexicon() {
+    const word = el.lexWord.value.trim();
+    const say = el.lexSay.value.trim();
+    if (!word || !say) {
+      el.lexHint.textContent = 'Type the word and how to say it.';
+      (word ? el.lexSay : el.lexWord).focus();
+      return;
+    }
+    setLexicon([...Core.cleanLexicon(state.settings.lexicon), [word, say]]);
+    el.lexWord.value = '';
+    el.lexSay.value = '';
+    el.lexHint.textContent = `Readout now says “${word}” as “${say}”.`;
+    el.lexWord.focus();
+  }
+
+  /* ================= headings ================= */
+
+  function openChapters() {
+    const doc = state.current;
+    if (!doc) return;
+    const hs = Core.headingsOf(state.segs, doc.text);
+    let here = -1;
+    for (let k = 0; k < hs.length; k++) if (hs[k].index <= state.idx) here = k;
+    el.chaptersList.replaceChildren(
+      ...hs.map((h, k) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'menu-item' + (k === here ? ' is-here' : '');
+        b.dataset.level = String(Math.min(6, h.level));
+        b.dataset.index = String(h.index);
+        b.textContent = h.title;
+        if (k === here) b.setAttribute('aria-current', 'true');
+        return b;
+      })
+    );
+    el.chaptersEmpty.hidden = hs.length > 0;
+    openSheet(el.chaptersSheet);
+    const cur = el.chaptersList.querySelector('.is-here');
+    if (cur) cur.scrollIntoView({ block: 'center' });
   }
 
   /* ================= toast ================= */
@@ -2893,27 +4004,25 @@
 
   function handleLaunchParams() {
     const params = new URLSearchParams(location.search);
-    if (![...params.keys()].length) return false;
+    const keys = [...params.keys()].filter((k) => k !== 'local');
+    if (!keys.length) return false;
     const action = params.get('action');
     const text = (params.get('text') || '').trim();
     const url = (params.get('url') || '').trim();
     const title = (params.get('title') || '').trim();
+    const shared = params.get('shared');
     try {
-      history.replaceState(null, '', location.pathname + location.hash);
+      const keep = params.get('local') ? '?local=' + encodeURIComponent(params.get('local')) : '';
+      history.replaceState(null, '', location.pathname + keep + location.hash);
     } catch (e) {
       /* ignore */
     }
-    const body = text || url;
-    if (body) {
-      if (/^https?:\/\/\S+$/i.test(body)) {
-        toast('Readout got a link, not the page’s text. Select the text on the page and share that instead.');
-        return false;
-      }
-      const doc = createDoc(Core.normalizeText(body), title && title !== body ? title : '');
-      openDoc(doc.id, { mode: 'listen' });
-      toast('Added. Press play to listen.');
-      return true;
+    if (shared) {
+      openShared();
+      return false;
     }
+    const body = text || url;
+    if (body) return addSharedText(body, title);
     if (action === 'new' || action === 'dictate') {
       newDoc({ noFocus: action === 'dictate' });
       if (action === 'dictate') toast('Tap Dictate and start talking.');
@@ -2928,15 +4037,19 @@
     const ids = [
       'app', 'library', 'scrim', 'main', 'menuBtn', 'docTitle', 'modeBtn', 'moreBtn', 'stage', 'welcome', 'reader',
       'editorWrap', 'editor', 'dictation', 'dictLabel', 'dictInterim', 'dictStopBtn', 'dock', 'player', 'scrub',
-      'progressPct', 'timeLeft', 'speedBtn', 'speedLabel', 'prevBtn', 'playBtn', 'playIcon', 'nextBtn', 'locateBtn',
+      'progressPct', 'playerStatus', 'timeLeft', 'speedBtn', 'speedLabel', 'prevBtn', 'playBtn', 'playIcon', 'nextBtn', 'locateBtn',
       'editTools', 'pasteBtn', 'openBtn', 'dictateBtn', 'fileInput', 'backupInput', 'speedSheet', 'rateReadout',
-      'rateSlider', 'rateChips', 'slowerBtn', 'fasterBtn', 'voiceSelect', 'previewBtn', 'voiceHint', 'pitchSlider',
-      'pitchValue', 'moreSheet', 'pinLabel', 'settingsSheet', 'followToggle', 'awakeToggle', 'bgToggle', 'dictLang',
-      'punctToggle', 'localToggleRow', 'localToggle', 'exportAllBtn', 'importBtn', 'about', 'toast', 'toastMsg',
-      'toastAction', 'newBtn', 'search', 'docList', 'docEmpty', 'installBtn', 'settingsBtn', 'pastePlayBtn',
-      'welcomeOpenBtn', 'welcomeNoteBtn', 'themeColor', 'themeGroup', 'sizeGroup', 'syncSetup', 'syncActive',
-      'syncConfirm', 'syncTokenLink', 'syncInput', 'syncConnectBtn', 'syncSetupMsg', 'syncCreateBtn', 'syncCancelBtn',
-      'syncStatus', 'syncNowBtn', 'syncKeyBtn', 'syncOffBtn', 'syncFixBtn', 'ocrSheet', 'ocrWhat', 'ocrYesBtn',
+      'rateSlider', 'dialScale', 'rateChips', 'slowerBtn', 'fasterBtn', 'vmodeGroup', 'accentGroup', 'kitVoiceSelect', 'voiceSelect',
+      'previewBtn', 'voiceHint', 'voiceBar', 'voiceBarFill', 'voiceGetBtn', 'voiceGetLabel', 'voiceStopBtn', 'voiceRetryBtn',
+      'pitchField', 'pitchSlider', 'pitchValue', 'sleepChips', 'sleepValue', 'moreSheet', 'pinLabel', 'chaptersSheet', 'chaptersList',
+      'chaptersEmpty', 'settingsSheet', 'followToggle', 'awakeToggle', 'autoNextToggle', 'citeToggle', 'notesToggle', 'voiceList',
+      'lexList', 'lexWord', 'lexSay', 'lexAddBtn', 'lexHint', 'dictLang', 'punctToggle', 'localToggleRow', 'localToggle',
+      'exportAllBtn', 'importBtn', 'about', 'toast', 'toastMsg', 'toastAction', 'newBtn', 'search', 'docList', 'docEmpty',
+      'installBtn', 'settingsBtn', 'pastePlayBtn', 'welcomeOpenBtn', 'welcomeNoteBtn', 'themeColor', 'themeGroup', 'sizeGroup',
+      'syncSetup', 'syncActive', 'syncConfirm', 'syncTokenLink', 'syncInput', 'syncConnectBtn', 'syncSetupMsg', 'syncCreateBtn',
+      'syncCancelBtn', 'syncStatus', 'syncNowBtn', 'syncKeyBtn', 'syncOffBtn', 'syncFixBtn', 'ocrSheet', 'ocrWhat', 'ocrSize',
+      'ocrYesBtn', 'voiceSheet', 'voiceSheetTitle', 'voiceSheetWhat', 'voiceSheetSize', 'voiceSheetNet', 'voiceSheetSpace',
+      'voiceSheetNote', 'voiceSheetYes', 'audio', 'previewAudio',
     ];
     for (const id of ids) el[id] = document.getElementById(id);
   }
@@ -3002,6 +4115,12 @@
       const b = e.target.closest('[data-act]');
       if (b) onMoreAction(b.dataset.act);
     });
+    el.chaptersList.addEventListener('click', (e) => {
+      const b = e.target.closest('[data-index]');
+      if (!b) return;
+      closeSheet(el.chaptersSheet);
+      seekTo(Number(b.dataset.index));
+    });
 
     el.reader.addEventListener('click', (e) => {
       const s = e.target.closest('.chunk');
@@ -3020,8 +4139,10 @@
     });
     el.speedBtn.addEventListener('click', () => {
       renderRate();
-      renderVoiceOptions();
+      renderVoicePanel();
+      renderSleep();
       openSheet(el.speedSheet);
+      refreshVoices();
     });
 
     const startScrub = () => (scrubbing = true);
@@ -3029,7 +4150,7 @@
     el.scrub.addEventListener('touchstart', startScrub, { passive: true });
     el.scrub.addEventListener('input', () => {
       scrubbing = true;
-      const n = state.chunks.length;
+      const n = state.segs.length;
       const i = Number(el.scrub.value);
       const max = Math.max(1, n - 1);
       el.scrub.style.setProperty('--fill', (i / max) * 100 + '%');
@@ -3038,15 +4159,7 @@
     });
     el.scrub.addEventListener('change', () => {
       scrubbing = false;
-      const i = Number(el.scrub.value);
-      tts.wordOffset = 0;
-      state.idx = i;
-      lastManualScroll = 0;
-      if (tts.playing) speakCurrent(true);
-      else {
-        highlightChunk(i, { scroll: 'force' });
-        queuePositionSave();
-      }
+      seekTo(Number(el.scrub.value));
     });
 
     const markManual = () => (lastManualScroll = Date.now());
@@ -3063,11 +4176,23 @@
     });
     el.slowerBtn.addEventListener('click', () => setRate(state.settings.rate - 0.1));
     el.fasterBtn.addEventListener('click', () => setRate(state.settings.rate + 0.1));
-    el.voiceSelect.addEventListener('change', () => setVoice(el.voiceSelect.value));
+    el.voiceSelect.addEventListener('change', () => setDeviceVoice(el.voiceSelect.value));
+    el.kitVoiceSelect.addEventListener('change', () => setSpeaker(el.kitVoiceSelect.value));
+    el.vmodeGroup.addEventListener('change', (e) => setVoiceMode(e.target.value));
+    el.accentGroup.addEventListener('change', (e) => setAccent(e.target.value));
     el.previewBtn.addEventListener('click', previewVoice);
+    el.voiceGetBtn.addEventListener('click', () => askDownload(el.voiceGetBtn.dataset.id || kitVoiceId(state.settings.voiceMode)));
+    el.voiceStopBtn.addEventListener('click', stopDownload);
+    el.voiceRetryBtn.addEventListener('click', checkNaturalAgain);
     el.pitchSlider.addEventListener('input', () => setPitch(el.pitchSlider.value));
+    el.sleepChips.addEventListener('click', (e) => {
+      const b = e.target.closest('[data-sleep]');
+      if (!b) return;
+      setSleep(b.dataset.sleep);
+      if (sleep.mode) toast(sleep.mode === 'end' ? 'Readout will stop at the end of this text.' : `Readout will stop in ${sleep.mode} minutes.`);
+    });
 
-    for (const d of [el.speedSheet, el.moreSheet, el.settingsSheet, el.ocrSheet]) {
+    for (const d of [el.speedSheet, el.moreSheet, el.settingsSheet, el.ocrSheet, el.voiceSheet, el.chaptersSheet]) {
       d.addEventListener('click', (e) => {
         if (e.target.closest('[data-close]')) {
           closeSheet(d);
@@ -3079,6 +4204,7 @@
         }
       });
     }
+    el.speedSheet.addEventListener('close', stopPreview);
 
     el.editor.addEventListener('input', onEditorInput);
     el.editor.addEventListener('compositionstart', () => (editing.composing = true));
@@ -3154,14 +4280,31 @@
     el.awakeToggle.addEventListener('change', () => {
       state.settings.keepAwake = el.awakeToggle.checked;
       saveSettings();
-      wake.want('play', tts.playing && state.settings.keepAwake);
+      wake.want('play', tts.playing && tts.engine === 'device' && state.settings.keepAwake);
     });
-    el.bgToggle.addEventListener('change', () => {
-      state.settings.background = el.bgToggle.checked;
+    el.autoNextToggle.addEventListener('change', () => {
+      state.settings.autoNext = el.autoNextToggle.checked;
       saveSettings();
-      if (state.settings.background && tts.playing) bgAudio.start();
-      else bgAudio.stop();
     });
+    el.citeToggle.addEventListener('change', () => {
+      state.settings.skipCitations = el.citeToggle.checked;
+      saveSettings();
+      replanCurrent();
+    });
+    el.notesToggle.addEventListener('change', () => {
+      state.settings.includeNotes = el.notesToggle.checked;
+      saveSettings();
+    });
+    el.lexAddBtn.addEventListener('click', addLexicon);
+    for (const i of [el.lexWord, el.lexSay]) {
+      i.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          if (i === el.lexWord && !el.lexSay.value.trim()) el.lexSay.focus();
+          else addLexicon();
+        }
+      });
+    }
     el.punctToggle.addEventListener('change', () => {
       state.settings.spokenPunct = el.punctToggle.checked;
       saveSettings();
@@ -3251,6 +4394,7 @@
       } else {
         if (wake.reasons.size) wake.acquire();
         if (Date.now() - sync.lastTry > 5000) syncNow();
+        if (tts.playing && curSpan >= 0 && spans[curSpan]) followSpan(spans[curSpan]);
       }
     });
     window.addEventListener('pagehide', () => {
@@ -3281,24 +4425,63 @@
     });
   }
 
-  function registerServiceWorker() {
-    if (!('serviceWorker' in navigator)) return;
-    const local = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
-    if (location.protocol !== 'https:' && !local) return;
-    if (local && !CONFIG.swOnLocalhost) return;
-    const reg = () => navigator.serviceWorker.register('sw.js').catch(() => {});
-    if (document.readyState === 'complete') reg();
-    else window.addEventListener('load', reg);
+  // The service worker makes Readout work offline and cross-origin isolated (it adds the
+  // COOP/COEP headers GitHub Pages can't send). A page isn't controlled on its first visit,
+  // so it reloads once then.
+  const COI_RELOAD = 'readout-coi-reload';
+  async function registerServiceWorker() {
+    if (!('serviceWorker' in navigator)) return false;
+    const local = LOOPBACK.test(location.hostname);
+    if (location.protocol !== 'https:' && !local) return false;
+    if (local && !CONFIG.swOnLocalhost) return false;
+    let reg;
+    try {
+      reg = await navigator.serviceWorker.register('sw.js');
+    } catch (e) {
+      return false;
+    }
+    if (self.crossOriginIsolated) {
+      sessionStorage.removeItem(COI_RELOAD);
+      return false;
+    }
+    if (sessionStorage.getItem(COI_RELOAD)) return false; // reloaded once already (no credentialless here)
+    // A new worker (the first visit, or the update from 1.x, whose worker adds no headers)
+    // first keeps the app and readkit for offline use; the reload waits for it to take over.
+    const pending = reg.installing || reg.waiting;
+    if (pending) {
+      await new Promise((r) => {
+        const done = () => (pending.state === 'activated' || pending.state === 'redundant') && r();
+        pending.addEventListener('statechange', done);
+        done();
+        setTimeout(r, 120000);
+      });
+    }
+    await navigator.serviceWorker.ready;
+    if (!navigator.serviceWorker.controller) {
+      await new Promise((r) => {
+        navigator.serviceWorker.addEventListener('controllerchange', r, { once: true });
+        setTimeout(r, 4000);
+      });
+    }
+    // Never in the middle of something.
+    const busy = tts.playing || dict.on || state.mode === 'edit' || !!document.querySelector('dialog[open]') || (el.toastAction && !el.toast.hidden && !el.toastAction.hidden);
+    if (!navigator.serviceWorker.controller || busy) return false;
+    sessionStorage.setItem(COI_RELOAD, '1');
+    flushDocs();
+    location.reload();
+    return true;
   }
 
   /* ================= start ================= */
 
   async function init() {
     cacheElements();
+    au.el = el.audio;
     buildRateChips();
     buildDictLangs();
     bindEvents();
     setupMediaSession();
+    const kitReady = loadKit();
     await store.init();
     let docs = [];
     let positions = [];
@@ -3320,6 +4503,8 @@
       sync.lastOk = syncSaved.lastOk || 0;
     }
     state.settings = Object.assign({}, DEFAULTS, saved || {});
+    delete state.settings.background; // 1.x's "Try to keep reading when locked"
+    if (!MODE_NAME[state.settings.voiceMode]) state.settings.voiceMode = DEFAULTS.voiceMode;
     applyTheme();
     renderRate();
     state.docs = (docs || []).filter((d) => d && typeof d.id === 'string' && typeof d.text === 'string');
@@ -3333,17 +4518,27 @@
       state.settings.seenWelcome = true;
       saveSettings();
     }
+    try {
+      await kitReady;
+    } catch (e) {
+      console.error('Readout: readkit failed to load', e);
+      throw e;
+    }
     loadVoices();
     renderLibrary();
     if (!handleLaunchParams()) {
       const last = state.docs.find((d) => d.id === state.settings.lastDocId);
-      if (last) openDoc(last.id);
-      else openNextOrWelcome();
+      if (last && !state.current) openDoc(last.id);
+      else if (!state.current) openNextOrWelcome();
     }
+    window.__readout = { state, tts, dict, sync, editing, Core, au, kit, sleep, queue, chooseEngine, seekTo, setSleep };
     registerServiceWorker();
-    if (!tts.ok) toast('This browser can’t read aloud. Open Readout in Chrome.');
+    if (!tts.ok && !playerSupported()) toast('This browser can’t read aloud. Open Readout in Chrome.');
     if (store.memoryOnly) toast('This browser isn’t allowing storage, so texts won’t be saved.');
-    window.__readout = { state, tts, dict, sync, editing, Core };
+    refreshVoices().then(() => {
+      renderRate();
+      warmVoiceSoon();
+    });
     syncNow();
   }
 

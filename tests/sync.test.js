@@ -343,4 +343,38 @@ test('simulation: devices agree with deletions too', () => {
   }
 });
 
+/* ---------- 2.0: the pronunciation list syncs in its own file ---------- */
+
+test('pronunciations: the newer list wins, and a side without one keeps the other', () => {
+  const older = { lexicon: [['Kokoro', 'koh koh roh']], at: 100 };
+  const newer = { lexicon: [['Kokoro', 'ko ko ro'], ['GIF', 'jif']], at: 200 };
+  assert.deepStrictEqual(merge({ docs: [], prefs: older }, { docs: [], prefs: newer }).prefs, { lexicon: [['GIF', 'jif'], ['Kokoro', 'ko ko ro']], at: 200 });
+  assert.deepStrictEqual(merge({ docs: [], prefs: newer }, { docs: [], prefs: older }).prefs.at, 200);
+  assert.deepStrictEqual(merge({ docs: [], prefs: older }, { docs: [] }).prefs, older);
+  assert.strictEqual(merge({ docs: [] }, { docs: [] }).prefs, null);
+  // an emptied list is a change too
+  assert.deepStrictEqual(merge({ docs: [], prefs: { lexicon: [], at: 300 } }, { docs: [], prefs: newer }).prefs, { lexicon: [], at: 300 });
+});
+
+test('pronunciations: round-trip through the gist, and versions before 2.0 leave the file alone', () => {
+  const m = merge({ docs: [doc('a', 'Text.', 5, { d1: 1 })], prefs: { lexicon: [['Readout', 'read out']], at: 9 } }, {});
+  const files = C.buildSyncFiles(m);
+  assert.ok(C.SYNC_PREFS in files && C.isSyncFile(C.SYNC_PREFS));
+  assert.deepStrictEqual(C.parseSyncFiles(files).prefs, { lexicon: [['Readout', 'read out']], at: 9 });
+  // no list ever set: no file, so a 1.x gist looks the same as before
+  assert.ok(!(C.SYNC_PREFS in C.buildSyncFiles(merge({ docs: [doc('a', 'Text.', 5, { d1: 1 })] }, {}))));
+  // what a 1.x device writes (no prefs in its merge) never deletes the file: its diff only
+  // removes index and shard files, so the old rule is checked here
+  const oldIsSyncFile = (name) => name === 'readout-index.json' || /^readout-docs-[0-9a-f]\.json$/.test(name);
+  assert.ok(!oldIsSyncFile(C.SYNC_PREFS));
+  // and a 2.0 device reading a gist without the file keeps its own list
+  const again = merge({ docs: [], prefs: { lexicon: [['x', 'ex']], at: 4 } }, C.parseSyncFiles(C.buildSyncFiles(merge({ docs: [] }, {}))));
+  assert.deepStrictEqual(again.prefs, { lexicon: [['x', 'ex']], at: 4 });
+});
+
+test('positions keep the 1.x format (offset, progress, done, at)', () => {
+  const m = merge({ docs: [doc('a', 'One. Two.', 5, { d1: 1 })], positions: [{ id: 'a', offset: 5, progress: 0.5, done: false, at: 7, extra: 'x' }] }, {});
+  assert.deepStrictEqual(m.positions, [{ id: 'a', offset: 5, progress: 0.5, done: false, at: 7 }]);
+});
+
 console.log(`${passed} sync tests passed`);

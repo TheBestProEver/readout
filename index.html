@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
   <title>Readout</title>
-  <meta name="description" content="Paste text and hear it read aloud. Dictate notes by voice.">
+  <meta name="description" content="Paste text or open a file and hear it read aloud, even with the screen off. Dictate notes by voice.">
   <meta name="theme-color" content="#F6F7F9" id="themeColor">
   <meta name="color-scheme" content="light dark">
   <link rel="manifest" href="manifest.webmanifest">
@@ -13,9 +13,9 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600&family=Literata:wght@400;500;600&display=swap">
-  <link rel="stylesheet" href="styles.css?v=3">
-  <script src="core.js?v=3" defer></script>
-  <script src="app.js?v=3" defer></script>
+  <link rel="stylesheet" href="styles.css?v=4">
+  <script src="core.js?v=4" defer></script>
+  <script src="app.js?v=4" defer></script>
 </head>
 <body>
   <svg xmlns="http://www.w3.org/2000/svg" width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
@@ -43,6 +43,9 @@
     <symbol id="i-locate" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.5"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3"/></symbol>
     <symbol id="i-sync" viewBox="0 0 24 24"><path d="M19.5 12a7.5 7.5 0 0 1-13 5.1M4.5 12a7.5 7.5 0 0 1 13-5.1M17.5 3.5v3.6h-3.6M6.5 20.5v-3.6h3.6"/></symbol>
     <symbol id="i-voice" viewBox="0 0 24 24"><path d="M4 9.5v5h3.5L12 19V5L7.5 9.5H4zM15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/></symbol>
+    <symbol id="i-list" viewBox="0 0 24 24"><path d="M9 6.5h11M9 12h11M9 17.5h11"/><circle class="fill" cx="4.75" cy="6.5" r="1.25"/><circle class="fill" cx="4.75" cy="12" r="1.25"/><circle class="fill" cx="4.75" cy="17.5" r="1.25"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M19.5 14.5A8 8 0 0 1 9.5 4.5a8 8 0 1 0 10 10z"/></symbol>
+    <symbol id="i-wave" viewBox="0 0 24 24"><path d="M4 10v4M8 7v10M12 4v16M16 8v8M20 10.5v3"/></symbol>
   </svg>
 
   <div class="app" id="app">
@@ -97,9 +100,9 @@
       <footer class="dock" id="dock">
         <div class="player" id="player">
           <input class="scrub" id="scrub" type="range" min="0" max="0" value="0" step="1" aria-label="Position in text">
-          <div class="player-meta"><span id="progressPct">0%</span><span id="timeLeft"></span></div>
+          <div class="player-meta"><span id="progressPct">0%</span><span class="player-status" id="playerStatus"></span><span id="timeLeft"></span></div>
           <div class="transport">
-            <button class="speed-btn" id="speedBtn" type="button" aria-haspopup="dialog" aria-label="Speed and voice"><span id="speedLabel">1×</span></button>
+            <button class="speed-btn" id="speedBtn" type="button" aria-haspopup="dialog" aria-label="Speed, voice and sleep timer"><span id="speedLabel">1×</span></button>
             <button class="icon-btn icon-btn-lg" id="prevBtn" type="button" aria-label="Previous sentence"><svg class="ic"><use href="#i-prev"/></svg></button>
             <button class="play-btn" id="playBtn" type="button" aria-label="Play"><svg class="ic"><use href="#i-play" id="playIcon"/></svg></button>
             <button class="icon-btn icon-btn-lg" id="nextBtn" type="button" aria-label="Next sentence"><svg class="ic"><use href="#i-next"/></svg></button>
@@ -115,7 +118,11 @@
     </main>
   </div>
 
-  <input type="file" id="fileInput" accept=".txt,.text,.md,.markdown,.pdf,text/plain,text/markdown,application/pdf,image/*" multiple hidden>
+  <!-- One element for the whole session: audio that keeps playing with the screen off. -->
+  <audio id="audio" preload="auto"></audio>
+  <audio id="previewAudio" preload="auto"></audio>
+
+  <input type="file" id="fileInput" accept=".pdf,.docx,.odt,.odp,.pptx,.epub,.rtf,.html,.htm,.mhtml,.md,.markdown,.txt,.text,application/pdf,image/*,text/plain,text/markdown,text/html,application/rtf,application/epub+zip,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.presentationml.presentation,application/vnd.oasis.opendocument.text,application/vnd.oasis.opendocument.presentation" multiple hidden>
   <input type="file" id="backupInput" accept=".json,application/json" hidden>
 
   <dialog class="sheet" id="speedSheet" aria-labelledby="speedSheetTitle">
@@ -129,20 +136,56 @@
       <button class="icon-btn rate-step" id="fasterBtn" type="button" aria-label="Faster"><span class="rate-sign" aria-hidden="true">+</span></button>
     </div>
     <input class="dial" id="rateSlider" type="range" min="0.5" max="4" step="0.05" value="1" aria-label="Speed">
-    <div class="dial-scale" aria-hidden="true"><span>0.5×</span><span>1×</span><span>2×</span><span>3×</span><span>4×</span></div>
+    <div class="dial-scale" id="dialScale" aria-hidden="true"></div>
     <div class="chips" id="rateChips" role="group" aria-label="Speed presets"></div>
 
     <div class="field">
-      <label class="field-label" for="voiceSelect">Voice</label>
-      <div class="field-row">
-        <select id="voiceSelect" class="select"></select>
-        <button class="btn" id="previewBtn" type="button"><svg class="ic"><use href="#i-voice"/></svg>Preview</button>
+      <span class="field-label" id="vmodeLabel">Voice</span>
+      <div class="segmented" role="radiogroup" aria-labelledby="vmodeLabel" id="vmodeGroup">
+        <label><input type="radio" name="vmode" value="natural"><span>Natural</span></label>
+        <label><input type="radio" name="vmode" value="standard"><span>Standard</span></label>
+        <label><input type="radio" name="vmode" value="device"><span>Device</span></label>
       </div>
-      <p class="field-hint" id="voiceHint"></p>
     </div>
     <div class="field">
+      <span class="field-label" id="accentLabel">Accent</span>
+      <div class="segmented" role="radiogroup" aria-labelledby="accentLabel" id="accentGroup">
+        <label><input type="radio" name="accent" value="en-US"><span>American</span></label>
+        <label><input type="radio" name="accent" value="en-GB"><span>British</span></label>
+      </div>
+    </div>
+    <div class="field">
+      <label class="field-label" for="kitVoiceSelect" id="speakerLabel">Speaker</label>
+      <div class="field-row">
+        <select id="kitVoiceSelect" class="select" aria-labelledby="speakerLabel"></select>
+        <select id="voiceSelect" class="select" aria-labelledby="speakerLabel" hidden></select>
+        <button class="btn" id="previewBtn" type="button"><svg class="ic"><use href="#i-voice"/></svg>Preview</button>
+      </div>
+      <div class="voice-status" id="voiceStatus">
+        <p class="field-hint" id="voiceHint"></p>
+        <div class="bar" id="voiceBar" hidden><span id="voiceBarFill"></span></div>
+        <div class="field-row" id="voiceActions">
+          <button class="btn btn-primary btn-sm" id="voiceGetBtn" type="button" hidden><svg class="ic"><use href="#i-download"/></svg><span id="voiceGetLabel">Download</span></button>
+          <button class="btn btn-sm" id="voiceStopBtn" type="button" hidden>Stop download</button>
+          <button class="btn btn-quiet btn-sm" id="voiceRetryBtn" type="button" hidden>Check again</button>
+        </div>
+      </div>
+    </div>
+    <div class="field" id="pitchField">
       <label class="field-label" for="pitchSlider">Pitch <span class="field-value" id="pitchValue">Normal</span></label>
       <input class="dial dial-thin" id="pitchSlider" type="range" min="0.5" max="1.5" step="0.05" value="1">
+    </div>
+
+    <div class="field">
+      <span class="field-label" id="sleepLabel">Sleep timer <span class="field-value" id="sleepValue">Off</span></span>
+      <div class="chips chips-tight" id="sleepChips" role="group" aria-labelledby="sleepLabel">
+        <button class="chip" type="button" data-sleep="0">Off</button>
+        <button class="chip" type="button" data-sleep="15">15 min</button>
+        <button class="chip" type="button" data-sleep="30">30 min</button>
+        <button class="chip" type="button" data-sleep="45">45 min</button>
+        <button class="chip" type="button" data-sleep="60">60 min</button>
+        <button class="chip" type="button" data-sleep="end">End of text</button>
+      </div>
     </div>
   </dialog>
 
@@ -152,15 +195,26 @@
       <button class="icon-btn" type="button" data-close aria-label="Close"><svg class="ic"><use href="#i-close"/></svg></button>
     </div>
     <div class="menu">
+      <button class="menu-item" type="button" data-act="chapters"><svg class="ic"><use href="#i-list"/></svg>Headings and chapters</button>
       <button class="menu-item" type="button" data-act="copy"><svg class="ic"><use href="#i-copy"/></svg>Copy text</button>
       <button class="menu-item" type="button" data-act="share"><svg class="ic"><use href="#i-share"/></svg>Share</button>
       <button class="menu-item" type="button" data-act="txt"><svg class="ic"><use href="#i-download"/></svg>Download as .txt</button>
       <button class="menu-item" type="button" data-act="md"><svg class="ic"><use href="#i-download"/></svg>Download as .md</button>
+      <button class="menu-item" type="button" data-act="audio"><svg class="ic"><use href="#i-wave"/></svg>Save audio</button>
       <button class="menu-item" type="button" data-act="reflow"><svg class="ic"><use href="#i-wrap"/></svg>Clean up line breaks</button>
       <button class="menu-item" type="button" data-act="restart"><svg class="ic"><use href="#i-restart"/></svg>Start over from the top</button>
       <button class="menu-item" type="button" data-act="pin"><svg class="ic"><use href="#i-pin"/></svg><span id="pinLabel">Pin to top</span></button>
       <button class="menu-item menu-item-danger" type="button" data-act="delete"><svg class="ic"><use href="#i-trash"/></svg>Delete</button>
     </div>
+  </dialog>
+
+  <dialog class="sheet" id="chaptersSheet" aria-labelledby="chaptersTitle">
+    <div class="sheet-head">
+      <h2 class="sheet-title" id="chaptersTitle">Headings and chapters</h2>
+      <button class="icon-btn" type="button" data-close aria-label="Close"><svg class="ic"><use href="#i-close"/></svg></button>
+    </div>
+    <div class="menu toc" id="chaptersList"></div>
+    <p class="group-desc" id="chaptersEmpty" hidden>This text has no headings to jump to.</p>
   </dialog>
 
   <dialog class="sheet sheet-tall" id="settingsSheet" aria-labelledby="settingsTitle">
@@ -193,8 +247,32 @@
     <section class="settings-group">
       <h3 class="group-title">Listening</h3>
       <label class="toggle"><span><span class="toggle-title">Follow along</span><span class="toggle-desc">Scroll to the sentence being read.</span></span><input type="checkbox" id="followToggle"><span class="switch" aria-hidden="true"></span></label>
-      <label class="toggle"><span><span class="toggle-title">Keep the screen on while reading</span><span class="toggle-desc">Phones stop web speech when the screen turns off.</span></span><input type="checkbox" id="awakeToggle"><span class="switch" aria-hidden="true"></span></label>
-      <label class="toggle"><span><span class="toggle-title">Try to keep reading when locked</span><span class="toggle-desc">Experimental. Adds lock-screen controls and asks the phone to keep Readout running.</span></span><input type="checkbox" id="bgToggle"><span class="switch" aria-hidden="true"></span></label>
+      <label class="toggle"><span><span class="toggle-title">Play next text automatically</span><span class="toggle-desc">When a text ends, go on to the next one in your list.</span></span><input type="checkbox" id="autoNextToggle"><span class="switch" aria-hidden="true"></span></label>
+      <label class="toggle"><span><span class="toggle-title">Skip citations</span><span class="toggle-desc">Leave out references like “(Lee et al., 2020)” and “[3]”.</span></span><input type="checkbox" id="citeToggle"><span class="switch" aria-hidden="true"></span></label>
+      <label class="toggle"><span><span class="toggle-title">Keep the screen on while reading</span><span class="toggle-desc">For the device voice, which stops when the screen turns off. The natural and standard voices keep reading with the screen off.</span></span><input type="checkbox" id="awakeToggle"><span class="switch" aria-hidden="true"></span></label>
+    </section>
+
+    <section class="settings-group">
+      <h3 class="group-title">Opening files</h3>
+      <label class="toggle"><span><span class="toggle-title">Include footnotes and margin notes</span><span class="toggle-desc">Running heads and page numbers are always left out. Applies to files you open from now on.</span></span><input type="checkbox" id="notesToggle"><span class="switch" aria-hidden="true"></span></label>
+    </section>
+
+    <section class="settings-group">
+      <h3 class="group-title">Voices on this device</h3>
+      <p class="group-desc" id="voicesDesc">Natural and standard voices are downloaded once and kept on this device.</p>
+      <ul class="voice-list" id="voiceList"></ul>
+    </section>
+
+    <section class="settings-group">
+      <h3 class="group-title">Pronunciations</h3>
+      <p class="group-desc">Tell Readout how to say a word. With sync on, the list is on all your devices.</p>
+      <ul class="lex-list" id="lexList"></ul>
+      <div class="lex-add">
+        <input class="input" id="lexWord" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Word" aria-label="Word">
+        <input class="input" id="lexSay" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Say it as" aria-label="Say it as">
+        <button class="btn" id="lexAddBtn" type="button"><svg class="ic"><use href="#i-plus"/></svg>Add</button>
+      </div>
+      <p class="field-hint" id="lexHint">Write how it sounds, like “Kokoro” as “koh koh roh”.</p>
     </section>
 
     <section class="settings-group">
@@ -257,10 +335,28 @@
       <h2 class="sheet-title" id="ocrTitle">Read the text in the pictures?</h2>
       <button class="icon-btn" type="button" data-close aria-label="Close"><svg class="ic"><use href="#i-close"/></svg></button>
     </div>
-    <p class="group-desc"><span id="ocrWhat"></span>, so there’s no text in it yet. Readout can find the words in the pictures, right on this device. The first time, that needs a one-time download of about 5 MB.</p>
+    <p class="group-desc"><span id="ocrWhat"></span>. Readout can find the words in the pictures, right on this device. The first time, that needs a one-time download of about <span id="ocrSize">7 MB</span>.</p>
     <div class="field-row">
       <button class="btn btn-primary" id="ocrYesBtn" type="button">Read the text</button>
       <button class="btn btn-quiet" type="button" data-close>Cancel</button>
+    </div>
+  </dialog>
+
+  <dialog class="sheet" id="voiceSheet" aria-labelledby="voiceSheetTitle">
+    <div class="sheet-head">
+      <h2 class="sheet-title" id="voiceSheetTitle">Download a voice?</h2>
+      <button class="icon-btn" type="button" data-close aria-label="Close"><svg class="ic"><use href="#i-close"/></svg></button>
+    </div>
+    <p class="group-desc" id="voiceSheetWhat"></p>
+    <dl class="facts">
+      <div><dt>Download</dt><dd id="voiceSheetSize"></dd></div>
+      <div><dt>Connection</dt><dd id="voiceSheetNet"></dd></div>
+      <div><dt>Free space</dt><dd id="voiceSheetSpace"></dd></div>
+    </dl>
+    <p class="field-hint" id="voiceSheetNote"></p>
+    <div class="field-row">
+      <button class="btn btn-primary" id="voiceSheetYes" type="button"><svg class="ic"><use href="#i-download"/></svg>Download</button>
+      <button class="btn btn-quiet" type="button" data-close>Not now</button>
     </div>
   </dialog>
 

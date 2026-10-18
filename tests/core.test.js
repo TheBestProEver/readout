@@ -1,104 +1,158 @@
+// Core helpers and the text pipeline Readout builds on (readkit's plan()): node tests/core.test.js
 const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
 const C = require('../core.js');
 
 let passed = 0;
+const tests = [];
 function test(name, fn) {
-  try {
-    fn();
-    passed++;
-  } catch (e) {
-    console.error('FAIL', name);
-    console.error(e);
-    process.exitCode = 1;
-  }
+  tests.push([name, fn]);
 }
-const slices = (text, chunks) => chunks.map((c) => text.slice(c.start, c.end));
+const shown = (text, segs) => segs.map((s) => text.slice(s.start, s.end));
 
-test('basic sentences', () => {
+/* ---------- the speech plan (readkit plan(), as Readout calls it) ---------- */
+
+test('sentences come out with their place in the text', (K) => {
   const t = 'Hello there. How are you? I am fine!';
-  assert.deepStrictEqual(slices(t, C.chunkText(t)), ['Hello there.', 'How are you?', 'I am fine!']);
+  assert.deepStrictEqual(shown(t, K.plan(t)), ['Hello there.', 'How are you?', 'I am fine!']);
 });
 
-test('offsets map to original text and never overlap', () => {
+test('segments are ordered, never overlap, and map back to the text', (K) => {
   const t = 'First line here.\n\nSecond paragraph, with a comma. And more.\n- a list item\n- another one';
-  const ch = C.chunkText(t);
+  const segs = K.plan(t);
   let last = 0;
-  for (const c of ch) {
-    assert.ok(c.start >= last && c.end > c.start, 'ordered');
-    last = c.end;
+  for (const s of segs) {
+    assert.ok(s.start >= last && s.end > s.start, 'ordered');
+    last = s.end;
+    for (const a of s.align) assert.ok(a[2] >= s.start && a[3] <= s.end && a[1] <= s.spoken.length, 'align inside the segment');
   }
-  assert.deepStrictEqual(slices(t, ch), ['First line here.', 'Second paragraph, with a comma.', 'And more.', '- a list item', '- another one']);
+  assert.deepStrictEqual(shown(t, segs), ['First line here.', 'Second paragraph, with a comma.', 'And more.', 'a list item', 'another one']);
+  assert.deepStrictEqual(segs.map((s) => s.kind), ['sentence', 'sentence', 'sentence', 'item', 'item']);
 });
 
-test('hard-wrapped sentence is read as one chunk', () => {
+test('a hard-wrapped sentence is one segment, spoken without the line break', (K) => {
   const t = 'This sentence was wrapped by an email client because it is fairly\nlong and keeps going onto a second line.';
-  const ch = C.chunkText(t);
-  assert.strictEqual(ch.length, 1);
-  assert.ok(slices(t, ch)[0].includes('\n'));
+  const segs = K.plan(t);
+  assert.strictEqual(segs.length, 1);
+  assert.ok(shown(t, segs)[0].includes('\n') && !segs[0].spoken.includes('\n'));
 });
 
-test('heading line stays separate', () => {
-  const t = 'Chapter Five\nThe city grows as people settle.';
-  assert.deepStrictEqual(slices(t, C.chunkText(t)), ['Chapter Five', 'The city grows as people settle.']);
-});
-
-test('long sentence is split under the max', () => {
-  const t = 'word '.repeat(200).trim() + '.';
-  const ch = C.chunkText(t);
-  assert.ok(ch.length > 4);
-  for (const c of ch) assert.ok(c.end - c.start <= C.MAX_CHUNK, 'chunk too long: ' + (c.end - c.start));
-  // all words covered
-  const joined = slices(t, ch).join(' ');
-  assert.strictEqual(C.wordCount(joined), 200);
-});
-
-test('long sentence prefers clause breaks', () => {
-  const t = 'A'.repeat(10) + ' ' + 'alpha beta gamma delta, '.repeat(12) + 'end.';
-  const ch = C.chunkText(t);
-  for (const s of slices(t, ch).slice(0, -1)) assert.ok(/,$/.test(s), 'should end at comma: ' + s.slice(-20));
-});
-
-test('abbreviations do not split', () => {
+test('abbreviations do not split and are spoken in full', (K) => {
   const t = 'I met Dr. Smith at 5 p.m. yesterday. Then we left.';
-  const s = slices(t, C.chunkText(t));
-  assert.strictEqual(s[s.length - 1], 'Then we left.');
-  assert.ok(s[0].startsWith('I met Dr. Smith'));
+  const segs = K.plan(t);
+  assert.deepStrictEqual(shown(t, segs), ['I met Dr. Smith at 5 p.m. yesterday.', 'Then we left.']);
+  assert.strictEqual(segs[0].spoken, 'I met Doctor Smith at five P M yesterday.');
 });
 
-test('symbol-only lines are skipped', () => {
+test('markup, rules and links are not read out symbol by symbol', (K) => {
+  const segs = K.plan('## Title with **bold** and a link https://example.com/a?b=c here\n\n* * *\n\n> quoted line');
+  const spoken = segs.map((s) => s.spoken).join(' ');
+  assert.ok(!/[#*>]|https/.test(spoken), spoken);
+  assert.ok(/example dot com/.test(spoken), spoken);
+  assert.strictEqual(segs[0].kind, 'heading');
+});
+
+test('citations are skipped by default, and read when asked', (K) => {
+  const t = 'As shown before (Lee et al., 2020), the effect holds [3].';
+  assert.strictEqual(K.plan(t)[0].spoken, 'As shown before, the effect holds.');
+  assert.ok(/Lee and others/.test(K.plan(t, { skip: { citations: false } })[0].spoken));
+});
+
+test('a long sentence is split into readable pieces that cover every word', (K) => {
+  const t = 'word '.repeat(200).trim() + '.';
+  const segs = K.plan(t);
+  assert.ok(segs.length > 2);
+  for (const s of segs) assert.ok(s.spoken.length <= 320, 'piece too long: ' + s.spoken.length);
+  assert.strictEqual(C.wordCount(segs.map((s) => s.spoken).join(' ')), 200);
+});
+
+test('the pronunciation list changes what is said, not what is shown', (K) => {
+  const t = 'Readout reads it. So does readout.';
+  const segs = K.plan(t, { lexicon: C.lexiconMap([['readout', 'read out']]) });
+  assert.deepStrictEqual(shown(t, segs), ['Readout reads it.', 'So does readout.']);
+  assert.ok(/^read out reads it/i.test(segs[0].spoken) && /read out\.$/.test(segs[1].spoken), segs.map((s) => s.spoken));
+});
+
+test('symbol-only lines are skipped and empty text has no segments', (K) => {
   const t = 'Before.\n* * *\n---\nAfter.';
-  assert.deepStrictEqual(slices(t, C.chunkText(t)), ['Before.', 'After.']);
+  assert.deepStrictEqual(shown(t, K.plan(t)), ['Before.', 'After.']);
+  assert.deepStrictEqual(K.plan(''), []);
+  assert.deepStrictEqual(K.plan('   \n\n  '), []);
 });
 
-test('empty and whitespace text', () => {
-  assert.deepStrictEqual(C.chunkText(''), []);
-  assert.deepStrictEqual(C.chunkText('   \n\n  '), []);
+test('headings list for jumping within a text', (K) => {
+  const t = '# Part One\n\nText here.\n\n## Chapter 2\n\nMore text.\n\nCHAPTER III\n\nEnd.';
+  const segs = K.plan(t);
+  const h = C.headingsOf(segs, t);
+  assert.deepStrictEqual(h.map((x) => [x.title, x.level]), [['Part One', 1], ['Chapter 2', 2], ['CHAPTER III', 1]]);
+  assert.strictEqual(shown(t, [segs[h[1].index]])[0], 'Chapter 2');
 });
 
-test('speakable keeps length and drops markdown and urls', () => {
-  const s = '## Title with **bold** and a link https://example.com/a?b=c here — ok';
-  const out = C.speakable(s);
-  assert.strictEqual(out.length, s.length);
-  assert.ok(!out.includes('#') && !out.includes('*') && !out.includes('https'));
-  assert.ok(out.includes('link'));
-  const q = '> quoted line\n> more';
-  assert.strictEqual(C.speakable(q).length, q.length);
-  assert.ok(!C.speakable(q).includes('>'));
-  assert.ok(C.speakable('Wait... what').includes('...'));
+test('docToText leaves out running heads, footnotes and margin notes', (K) => {
+  const doc = {
+    blocks: [
+      { type: 'p', text: 'THE BOOK 12', skip: 'header' },
+      { type: 'note', text: 'A side note.', skip: 'margin' },
+      { type: 'p', text: 'Body text.' },
+      { type: 'note', text: '1 A footnote.', skip: 'footnote' },
+    ],
+  };
+  assert.strictEqual(K.docToText(doc), 'Body text.');
+  assert.strictEqual(K.docToText(doc, { keepSkipped: true }), 'THE BOOK 12\n\nA side note.\n\nBody text.\n\n1 A footnote.');
 });
 
-test('prefixLengths and findChunkIndex', () => {
+/* ---------- segment helpers ---------- */
+
+test('prefixLengths and findSegment', (K) => {
   const t = 'One. Two two. Three three three.';
-  const ch = C.chunkText(t);
-  const cum = C.prefixLengths(ch);
-  assert.strictEqual(cum.length, ch.length + 1);
-  assert.strictEqual(cum[ch.length], ch.reduce((n, c) => n + c.end - c.start, 0));
-  assert.strictEqual(C.findChunkIndex(ch, 0), 0);
-  assert.strictEqual(C.findChunkIndex(ch, ch[1].start), 1);
-  assert.strictEqual(C.findChunkIndex(ch, ch[1].start + 2), 1);
-  assert.strictEqual(C.findChunkIndex(ch, ch[2].end + 50), 2);
-  assert.strictEqual(C.findChunkIndex([], 10), 0);
+  const segs = K.plan(t);
+  const cum = C.prefixLengths(segs);
+  assert.strictEqual(cum.length, segs.length + 1);
+  assert.strictEqual(cum[segs.length], segs.reduce((n, s) => n + s.end - s.start, 0));
+  assert.strictEqual(C.findSegment(segs, 0), 0);
+  assert.strictEqual(C.findSegment(segs, segs[1].start), 1);
+  assert.strictEqual(C.findSegment(segs, segs[1].start + 2), 1);
+  assert.strictEqual(C.findSegment(segs, segs[2].end + 50), 2);
+  assert.strictEqual(C.findSegment([], 10), 0);
 });
+
+test('word positions: resume mid-sentence and highlight the word being said', (K) => {
+  const t = 'Intro. The fee was $5 today.';
+  const seg = K.plan(t)[1];
+  assert.strictEqual(seg.spoken, 'The fee was five dollars today.');
+  const within = t.indexOf('$5') - seg.start;
+  const from = C.spokenStartFor(seg, within);
+  assert.strictEqual(seg.spoken.slice(from), 'five dollars today.');
+  const k = C.alignAtSpoken(seg, seg.spoken.indexOf('dollars'));
+  const [a, n] = C.wordRange(seg, k);
+  assert.strictEqual(t.slice(seg.start + a, seg.start + a + n), '$5');
+  assert.strictEqual(C.spokenStartFor(seg, 0), 0);
+  assert.strictEqual(C.alignAtSpoken(seg, 999), -1);
+});
+
+test('cleanLexicon and lexiconMap', () => {
+  const l = C.cleanLexicon([['  Readout ', ' read out '], ['', 'x'], ['gif', ''], ['--', 'dash'], ['readout', 'reed out'], ['Kokoro', 'koh koh roh']]);
+  assert.deepStrictEqual(l, [['Kokoro', 'koh koh roh'], ['readout', 'reed out']]);
+  assert.deepStrictEqual(C.lexiconMap({ Ada: 'Ay da' }), { Ada: 'Ay da' });
+  assert.deepStrictEqual(C.cleanLexicon(null), []);
+});
+
+test('nextInOrder skips finished texts', () => {
+  const order = ['a', 'b', 'c', 'd'];
+  const done = new Set(['b']);
+  assert.strictEqual(C.nextInOrder(order, 'a', (id) => done.has(id)), 'c');
+  assert.strictEqual(C.nextInOrder(order, 'd'), null);
+  assert.strictEqual(C.nextInOrder(order, 'x'), null);
+});
+
+test('fadeGain', () => {
+  assert.strictEqual(C.fadeGain(20000, 10000), 1);
+  assert.strictEqual(C.fadeGain(5000, 10000), 0.5);
+  assert.strictEqual(C.fadeGain(-1, 10000), 0);
+});
+
+/* ---------- text helpers kept from 1.x ---------- */
 
 test('reflow joins wrapped lines and keeps paragraphs', () => {
   const t = 'The Muqaddimah describes how dynasties rise and how, over\ngenerations, they lose the solidarity that built them. It is a\nsweeping argument.\n\nA new paragraph starts here and it continues for a while\nonto another line.';
@@ -107,44 +161,6 @@ test('reflow joins wrapped lines and keeps paragraphs', () => {
   assert.ok(r.includes('\n\n'));
   assert.strictEqual(r.split('\n\n').length, 2);
   assert.strictEqual(C.reflow('infor-\nmation is key'), 'information is key');
-});
-
-test('stripRepeats removes running headers, footers, and page numbers', () => {
-  const words = ['apples', 'rivers', 'lanterns', 'harbors', 'meadows', 'engines', 'violins', 'glaciers'];
-  const pages = words.map((w, i) => {
-    const n = i + 1;
-    const body = Array.from({ length: 10 }, (_, k) => `Line ${k + 1} of the page about ${w}, which should stay put.`);
-    return [n % 2 ? `The Art of Reading  ${n}` : `${n}  Chapter 2: Slow Books`, ...body, `Page ${n} of 8`].join('\n');
-  });
-  const out = C.stripRepeats(pages);
-  words.forEach((w, i) => {
-    assert.strictEqual(out[i].split('\n').length, 10, 'keeps all body lines: ' + out[i]);
-    assert.ok(out[i].includes(`Line 1 of the page about ${w}`) && out[i].includes(`Line 10 of the page about ${w}`));
-    assert.ok(!/Page \d of 8|Art of Reading|Slow Books/.test(out[i]), 'drops running heads and page numbers: ' + out[i]);
-  });
-  // A heading on only one page stays, and so does everything in a short document.
-  const two = C.stripRepeats(['Introduction\nWhy we read.', 'Methods\nHow we read.\n2']);
-  assert.deepStrictEqual(two, ['Introduction\nWhy we read.', 'Methods\nHow we read.']);
-  assert.deepStrictEqual(C.stripRepeats(['iv\nPreface text.']), ['Preface text.']);
-});
-
-test('stripRepeats keeps numbered headings, words, and years', () => {
-  const pages = [1, 2, 3, 4, 5, 6].map((n) =>
-    [`Problem ${n} (10 points)`, ...Array.from({ length: 9 }, (_, k) => `Work line ${k} for problem ${n} goes here.`), `Smith ${n}`].join('\n')
-  );
-  const out = C.stripRepeats(pages);
-  out.forEach((p, i) => {
-    assert.ok(p.startsWith(`Problem ${i + 1} (10 points)`), 'keeps the heading: ' + p.slice(0, 40));
-    assert.ok(!/Smith/.test(p), 'drops the running foot');
-  });
-  for (const line of ['civil', 'ill', 'Mix', '2024']) assert.strictEqual(C.stripRepeats([line + '\nBody.'])[0], line + '\nBody.', line);
-  for (const line of ['12', '- 12 -', 'Page 3 of 9', 'iv', 'XL']) assert.strictEqual(C.stripRepeats([line + '\nBody.'])[0], 'Body.', line);
-});
-
-test('cleanOcr drops symbol junk and keeps words, dates, and numbers', () => {
-  assert.strictEqual(C.cleanOcr('Real sentence here.\n|| — ~ ||\n= =\nI think so.\n'), 'Real sentence here.\nI think so.');
-  assert.strictEqual(C.cleanOcr('on July 20, 1969.\nTotal due: $1,250.00\ny = 3x + 2\n«— | ;'), 'on July 20, 1969.\nTotal due: $1,250.00\ny = 3x + 2');
-  assert.strictEqual(C.letterCount('a1 b2 c'), 3);
 });
 
 test('deriveTitle', () => {
@@ -196,15 +212,43 @@ test('formatDuration and relativeTime', () => {
   assert.strictEqual(C.relativeTime(now - 26 * 3600000, now), 'yesterday');
 });
 
-test('big text performance', () => {
+/* ---------- the service worker's list of readkit files ---------- */
+
+test('sw.js caches every readkit runtime file (tools/readkit-files.mjs keeps the list)', () => {
+  const root = path.join(__dirname, '..');
+  const sw = fs.readFileSync(path.join(root, 'sw.js'), 'utf8');
+  const m = /\/\/ readkit files: begin\n([\s\S]*?)\n\s*\/\/ readkit files: end/.exec(sw);
+  assert.ok(m, 'the list markers are in sw.js');
+  const listed = JSON.parse('[' + m[1].replace(/,\s*$/, '') + ']');
+  const walk = (dir) => fs.readdirSync(path.join(root, dir), { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(dir + '/' + e.name) : [dir + '/' + e.name]));
+  const actual = ['readkit/index.js', ...walk('readkit/src'), ...walk('readkit/data').filter((f) => !/\.md$/.test(f))].sort();
+  assert.deepStrictEqual(listed.slice().sort(), actual);
+});
+
+/* ---------- speed ---------- */
+
+test('big text performance', (K) => {
   const para = 'Ibn Khaldun argued that group feeling binds people together. Over time, luxury weakens it, and the dynasty declines. ';
   const t = (para.repeat(8) + '\n\n').repeat(700); // ~650k chars
   const t0 = Date.now();
-  const ch = C.chunkText(t);
+  const segs = K.plan(t, { dialect: 'en-US' });
   const ms = Date.now() - t0;
-  assert.ok(ch.length > 10000);
-  assert.ok(ms < 3000, 'too slow: ' + ms + 'ms');
-  console.log(`  chunked ${t.length} chars into ${ch.length} chunks in ${ms} ms`);
+  assert.ok(segs.length > 10000);
+  assert.ok(ms < 5000, 'too slow: ' + ms + 'ms');
+  console.log(`  planned ${t.length} chars into ${segs.length} segments in ${ms} ms`);
 });
 
-console.log(`${passed} core tests passed`);
+(async () => {
+  const K = await import('../readkit/index.js');
+  for (const [name, fn] of tests) {
+    try {
+      await fn(K);
+      passed++;
+    } catch (e) {
+      console.error('FAIL', name);
+      console.error(e);
+      process.exitCode = 1;
+    }
+  }
+  console.log(`${passed}/${tests.length} core tests passed`);
+})();
