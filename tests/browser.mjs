@@ -67,16 +67,22 @@ export async function launchChrome(opts = {}) {
     try {
       const [port, wsPath] = fs.readFileSync(path.join(dir, 'DevToolsActivePort'), 'utf8').trim().split('\n');
       const close = async () => {
+        const gone = proc.exitCode !== null ? Promise.resolve() : new Promise((r) => proc.once('exit', r));
         try {
           proc.kill();
         } catch (e) {
           /* already gone */
         }
-        await sleep(500);
-        try {
-          fs.rmSync(dir, { recursive: true, force: true });
-        } catch (e) {
-          /* Chrome may still hold files for a moment */
+        await Promise.race([gone, sleep(5000)]);
+        // Chrome's helper processes may hold the profile's files for a few seconds more.
+        for (let k = 0; k < 20; k++) {
+          try {
+            fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+            if (!fs.existsSync(dir)) break;
+          } catch (e) {
+            /* still in use */
+          }
+          await sleep(500);
         }
       };
       return { proc, dir, url: `ws://127.0.0.1:${port}${wsPath}`, close };

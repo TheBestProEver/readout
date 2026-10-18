@@ -1,6 +1,8 @@
 // Readout 2.0 end to end, in headless Chrome with Android's freezing rule emulated:
 //   scan      a synthetic scanned book (scanner's hidden text layer, margin notes, footnotes,
 //             running heads) opened as a file -> clean text; the notes setting
+//   private   your own PDFs in READKIT_PRIVATE (with readkit golden files), read in place,
+//             scored in Node, deleted again; only numbers are printed
 //   plan      plan()-based highlighting: spans, spoken text, tap, headings list, pronunciations
 //   device    the device voice before anything is downloaded, and the offer to download
 //   piper     Standard (Piper en_US-ryan-medium): download dialog, playing in a hidden page for
@@ -9,6 +11,8 @@
 //   sleep     sleep timer with the page hidden (fade, stop), Play next text, End of text
 //   kokoro    Natural (Kokoro am_michael on WebGPU) the same way, hidden for over a minute
 //   layout    settings and sheets fit a 360 px screen; no console errors
+//   nokit     readkit blocked: Readout still starts, keeps texts and reads them line by line
+//   old       1.x features: dictation (a stand-in recognizer), search, themes, install, backup
 //   sw        the service worker on a server without headers: one reload to cross-origin
 //             isolation, COOP/COEP on responses, readkit cached, Google Fonts, pdf.js, Tesseract,
 //             onnxruntime from jsDelivr, gist sync, the share sheet's POST, ?text=, offline
@@ -221,6 +225,8 @@ async function main() {
       check(uk.spoken !== us && /third of April/.test(uk.spoken) && /March fourth|March the fourth/.test(us), 'and reads dates the British way', { us, uk: uk.spoken });
       await ev(`document.querySelector('#voiceSheet [data-close]').click(); return 1`);
       await phone.click('#accentGroup input[value="en-US"] + span');
+      // (Michael isn't downloaded either, so the question comes again, a moment later)
+      await waitFor(`T.$('voiceSheet').open && T.$('voiceSheetTitle').textContent === 'Download Michael?'`, 10000, 'the US voice question');
       await ev(`T.closeSheets(); return 1`);
       check((await ev(`return T.R().state.segs[1].spoken`)) === us, 'back to American');
     }
@@ -235,8 +241,9 @@ async function main() {
       check((await ev(`return T.R().chooseEngine().kind`)) === 'device', 'with nothing downloaded, the device voice reads');
       // (the taps above may have shown the one-time offer already)
       await ev(`T.R().state.settings.offeredVoice = false; T.R().au.offerShown = false; __toasts.length = 0; return 1`);
+      check(!(await ev(`return !!document.querySelector('dialog[open]')`)), 'no sheet left open', await ev(`return [...document.querySelectorAll('dialog[open]')].map((d) => d.id)`));
       await phone.click('#playBtn');
-      await waitFor(`T.R().tts.engine === 'device'`, 5000, 'device engine');
+      await waitFor(`T.R().tts.playing && T.R().tts.engine === 'device'`, 5000, 'device engine');
       check(true, 'play starts at once with the device voice');
       await waitFor(`__toasts.some((t) => /download Michael \\(326 MB, once\\)/.test(t))`, 8000, 'the offer');
       check(true, 'and Readout offers the natural voice once, with its size');
@@ -461,12 +468,85 @@ async function main() {
       await phone.screenshot(path.join(shots, 'readout-v2-speed.png'));
       await ev(`T.closeSheets(); T.$('moreBtn').click(); return 1`);
       check(!(await overflow('#moreSheet')).length, 'and the More menu', await overflow('#moreSheet'));
-      await ev(`T.closeSheets(); return 1`);
+      await ev(`T.closeSheets(); T.$('moreBtn').click(); document.querySelector('[data-act="chapters"]').click(); return 1`);
+      check(!(await overflow('#chaptersSheet')).length, 'and the headings list', await overflow('#chaptersSheet'));
+      // the download question, with its longest wording
+      await ev(`T.closeSheets(); T.$('voiceSheetTitle').textContent = 'Download Northern English Male?'; T.$('voiceSheetWhat').textContent = 'Michael is a natural-sounding American voice. It runs on this device (on its graphics chip), works offline, and keeps reading with the screen off.'; T.$('voiceSheetSize').textContent = '325.5 MB more (326 MB in all)'; T.$('voiceSheetNet').textContent = 'Not known (check that you’re on Wi-Fi)'; T.$('voiceSheetSpace').textContent = '123.4 GB'; T.$('voiceSheetNote').textContent = 'It downloads once and stays on this device. Voice licence: CC-BY-NC-SA-4.0 (RyanSpeech dataset).'; T.$('voiceSheet').showModal(); return 1`);
+      check(!(await overflow('#voiceSheet')).length, 'and the voice download question', await overflow('#voiceSheet'));
+      await phone.screenshot(path.join(shots, 'readout-v2-download.png'));
+      const longName = 'IMG_20261017_142233_scanned_course_reading_week_3_chapter_two.pdf';
+      await ev(`T.closeSheets(); T.$('ocrSize').textContent = '7 MB'; T.$('ocrWhat').textContent = '“${longName}” is scanned pages'; T.$('ocrSheet').showModal(); return 1`);
+      check(!(await overflow('#ocrSheet')).length, 'and the scanned pages question, with a long file name', await overflow('#ocrSheet'));
+      await ev(`T.closeSheets(); T.$('toastMsg').textContent = 'Opening “${longName}”…'; T.$('toastAction').textContent = 'Stop'; T.$('toastAction').hidden = false; T.$('toast').hidden = false; return 1`);
+      check(!(await overflow('#toast')).length, 'and a message about it', await overflow('#toast'));
+      await ev(`T.$('toast').hidden = true; return 1`);
     }
 
     console.log('Console');
     const bad = phone.logs.filter((l) => l.type === 'exception' || l.type === 'error');
     check(!bad.length, 'no errors on the phone', bad);
+
+    /* ---------- nokit ---------- */
+    if (want('nokit')) {
+      console.log('When readkit can’t load (blocked), the rest of Readout still works');
+      const nk = await newDevice(cdp, 'no-readkit phone', { phone: true, touch: false, init: PROBE });
+      devices.push(nk);
+      await nk.send('Network.enable');
+      await nk.send('Network.setBlockedURLs', { urls: ['*/readkit/index.js*'] });
+      await nk.goto(app.base + '/');
+      const st = await nk.eval(`await T.wait(() => T.R().state.current, 10000); const R = T.R(); return { failed: !!R.kit.failed, toasts: __toasts.slice(), segs: R.state.segs.length, spans: document.querySelectorAll('#reader .chunk').length, docs: R.state.docs.length }`);
+      check(st.failed && st.toasts.some((t) => /Part of Readout didn’t load/.test(t)), 'it starts anyway and says what is missing', st);
+      check(st.docs === 1 && st.segs > 0 && st.spans === st.segs, 'the library and the reader work (line by line)', st);
+      const note = await nk.eval(`const id = T.newNote('First line of a note. It has two sentences.\\nA second line.'); T.done(); const R = T.R(); return { segs: R.state.segs.map((s) => s.spoken), id }`);
+      check(note.segs.length === 2, 'a new note is read line by line', note.segs);
+      await nk.click('#playBtn');
+      check(await nk.eval(`await T.wait(() => T.R().tts.playing && T.R().tts.engine === 'device', 5000).then(() => true, () => false); const ok = T.R().tts.playing; T.$('playBtn').click(); return ok`), 'and the device voice reads it');
+      await nk.eval(`const dt = new DataTransfer(); dt.items.add(new File(['x'], 'a.txt', { type: 'text/plain' })); T.$('fileInput').files = dt.files; T.$('fileInput').dispatchEvent(new Event('change')); return 1`);
+      check(await nk.eval(`await new Promise((r) => setTimeout(r, 200)); return __toasts.some((t) => /Opening files didn’t load/.test(t))`), 'opening a file says it can’t, instead of failing silently');
+      const nbad = nk.logs.filter((l) => (l.type === 'exception' || l.type === 'error') && !/readkit failed to load/.test(l.text));
+      check(!nbad.length, 'no other errors', nbad);
+      await cdp.send('Target.closeTarget', { targetId: nk.targetId });
+    }
+
+    /* ---------- old ---------- */
+    if (want('old')) {
+      console.log('What 1.x did still works: dictation, search, themes, install, backup');
+      // A stand-in speech recognizer: one phrase, heard in two parts (interim, then final).
+      const FAKE_SR = `
+        window.__sr = { started: 0 };
+        class FakeSR {
+          start() {
+            __sr.started++;
+            const r = (t, f) => Object.assign([{ transcript: t, confidence: 0.9 }], { isFinal: f });
+            setTimeout(() => this.onresult && this.onresult({ resultIndex: 0, results: [r('hello there comma this is', false)] }), 100);
+            setTimeout(() => this.onresult && this.onresult({ resultIndex: 0, results: [r('hello there comma this is a note period', true)] }), 250);
+          }
+          stop() { setTimeout(() => this.onend && this.onend(), 10); }
+          abort() { setTimeout(() => this.onend && this.onend(), 10); }
+        }
+        window.SpeechRecognition = FakeSR; window.webkitSpeechRecognition = FakeSR;`;
+      const od = await newDevice(cdp, 'old features phone', { phone: true, touch: false, init: PROBE + FAKE_SR });
+      devices.push(od);
+      await od.goto(app.base + '/');
+      await od.eval(`T.newNote(''); return 1`);
+      await od.click('#dictateBtn');
+      const heard = await od.eval(`await T.wait(() => /note\\./.test(T.$('editor').value), 5000).catch(() => {}); return { text: T.$('editor').value, on: T.R().dict.on, shown: !T.$('dictation').hidden }`);
+      check(/^Hello there, this is a note\.$/.test(heard.text.trim()) && heard.on && heard.shown, 'dictation writes what is said, with spoken punctuation', heard);
+      await od.click('#dictStopBtn');
+      const after = await od.eval(`await new Promise((r) => setTimeout(r, 300)); T.done(); await new Promise((r) => setTimeout(r, 300)); return { on: T.R().dict.on, text: T.R().state.current.text, mode: T.R().state.mode, segs: T.R().state.segs.length }`);
+      check(!after.on && after.text.trim() === heard.text.trim() && after.mode === 'listen' && after.segs === 1, 'stopping keeps the note once, ready to listen to', after);
+      const found = await od.eval(`T.$('search').value = 'there, this'; T.$('search').dispatchEvent(new Event('input')); const n = document.querySelectorAll('#docList .doc-item').length; T.$('search').value = ''; T.$('search').dispatchEvent(new Event('input')); return { n, all: document.querySelectorAll('#docList .doc-item').length }`);
+      check(found.n === 1 && found.all === 2, 'the library search finds a text by its words', found);
+      const theme = await od.eval(`const pick = (g, v) => { const i = document.querySelector('#' + g + ' input[value="' + v + '"]'); i.checked = true; i.dispatchEvent(new Event('change', { bubbles: true })); }; pick('themeGroup', 'light'); const bg0 = getComputedStyle(document.body).backgroundColor; const fs0 = getComputedStyle(T.$('reader')).fontSize; pick('themeGroup', 'dark'); pick('sizeGroup', 'xl'); await new Promise((r) => setTimeout(r, 100)); const r = { theme: document.documentElement.dataset.theme, bg: [bg0, getComputedStyle(document.body).backgroundColor], fs: [fs0, getComputedStyle(T.$('reader')).fontSize], meta: T.$('themeColor').content }; pick('themeGroup', 'system'); pick('sizeGroup', 'm'); return r`);
+      check(theme.theme === 'dark' && theme.bg[0] !== theme.bg[1] && theme.fs[0] !== theme.fs[1] && theme.meta === '#131a2b', 'dark theme and text size apply', theme);
+      const inst = await od.eval(`window.__prompted = 0; const e = new Event('beforeinstallprompt', { cancelable: true }); e.prompt = () => { __prompted++; }; e.userChoice = Promise.resolve({ outcome: 'accepted' }); window.dispatchEvent(e); const shown = !T.$('installBtn').hidden; T.$('installBtn').click(); await new Promise((r) => setTimeout(r, 100)); return { shown, prompted: __prompted, hidden: T.$('installBtn').hidden }`);
+      check(inst.shown && inst.prompted === 1 && inst.hidden, 'Install app appears when Chrome offers it, and asks', inst);
+      const bk = await od.eval(`__downloads.length = 0; T.$('settingsBtn').click(); T.$('exportAllBtn').click(); T.closeSheets(); const d = __downloads[0]; const data = d && JSON.parse(await (await fetch(d.href)).text()); return { name: d && d.name, app: data && data.app, docs: data && data.docs.length, hasNote: !!data && data.docs.some((x) => /this is a note/.test(x.text)) }`);
+      check(/^readout-backup-\d{4}-\d\d-\d\d\.json$/.test(bk.name || '') && bk.app === 'readout' && bk.docs === 2 && bk.hasNote, 'Export all texts saves a backup file', bk);
+      const obad = od.logs.filter((l) => l.type === 'exception' || l.type === 'error');
+      check(!obad.length, 'no errors', obad);
+      await cdp.send('Target.closeTarget', { targetId: od.targetId });
+    }
 
     /* ---------- sw ---------- */
     if (want('sw')) await swSection(cdp, devices, models);
@@ -596,6 +676,10 @@ async function swSection(cdp, devices, models) {
     await settle(20000);
     await waitFor(`T.R().state.docs.some((d) => d.text === 'Shared the 1.x way.')`, 20000, 'GET share');
     check(true, 'the old GET ?text= share still works');
+
+    // a file of the app opened as a page (an iframe navigation) is not kept as the offline app
+    const kept = await ev(`const f = document.createElement('iframe'); f.src = 'manifest.webmanifest'; document.body.append(f); await new Promise((r) => { f.onload = r; setTimeout(r, 5000); }); f.remove(); await new Promise((r) => setTimeout(r, 300)); const k = (await caches.keys()).find((x) => x.startsWith('readout-shell-')); const r = k && (await (await caches.open(k)).match('./')); return r ? r.headers.get('Content-Type') : null`);
+    check(/text\/html/.test(kept || ''), 'the offline copy of the app page stays the app page', kept);
 
     console.log('Offline');
     await host.close();

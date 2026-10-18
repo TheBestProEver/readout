@@ -680,7 +680,7 @@ button { cursor: pointer; }
 .settings-group { padding: 6px 0 10px; border-top: 1px solid var(--rule); }
 .settings-group:first-of-type { border-top: 0; }
 .group-title { margin: 10px 0 4px; font-size: 15px; font-weight: 600; color: var(--ink-2); }
-.group-desc { margin: 4px 0 12px; color: var(--ink-2); }
+.group-desc { margin: 4px 0 12px; color: var(--ink-2); overflow-wrap: break-word; }
 
 .segmented { display: flex; padding: 3px; gap: 3px; border-radius: 12px; background: var(--sunk); }
 .segmented label { flex: 1; }
@@ -819,6 +819,7 @@ audio { display: none; }
   animation: toast-in 0.18s ease-out;
 }
 @keyframes toast-in { from { transform: translate(-50%, 10px); opacity: 0; } }
+.toast-msg { min-width: 0; overflow-wrap: anywhere; }
 .toast-action {
   flex: none;
   border: 0;

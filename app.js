@@ -181,21 +181,42 @@
     return opts;
   }
 
-  // Text -> segments. plan() never throws on real text; if it ever does, each line is read as it is.
+  // Text -> segments. plan() never throws on real text; if it ever does (or readkit didn't
+  // load), each line is read as it is.
   function planText(text) {
     if (!text || !/[\p{L}\p{N}]/u.test(text)) return [];
-    try {
-      return kit.K.plan(text, planOptions());
-    } catch (e) {
-      console.warn('Readout: plan() failed, reading line by line', e);
-      const out = [];
-      const re = /[^\n]+/g;
-      let m;
-      while ((m = re.exec(text))) {
-        if (/[\p{L}\p{N}]/u.test(m[0])) out.push({ index: out.length, start: m.index, end: m.index + m[0].length, spoken: m[0].trim(), kind: 'sentence', pauseAfterMs: 0, align: [] });
+    if (kit.K) {
+      try {
+        return kit.K.plan(text, planOptions());
+      } catch (e) {
+        console.warn('Readout: plan() failed, reading line by line', e);
       }
-      return out;
     }
+    const out = [];
+    const re = /[^\n]+/g;
+    let m;
+    while ((m = re.exec(text))) {
+      if (/[\p{L}\p{N}]/u.test(m[0])) out.push({ index: out.length, start: m.index, end: m.index + m[0].length, spoken: m[0].trim(), kind: 'sentence', pauseAfterMs: 0, align: [] });
+    }
+    return out;
+  }
+
+  // Utterance-sized pieces of spoken text: readkit's, or (without readkit) up to 200
+  // characters, cut at a space.
+  function utterancePieces(text) {
+    if (kit.system) return kit.system.chunkText(text);
+    const out = [];
+    let a = 0;
+    while (a < text.length) {
+      let b = Math.min(text.length, a + 200);
+      if (b < text.length) {
+        const sp = text.lastIndexOf(' ', b);
+        if (sp > a + 60) b = sp;
+      }
+      out.push({ start: a, end: b });
+      a = b;
+    }
+    return out;
   }
 
   /* ================= storage ================= */
@@ -969,7 +990,6 @@
     preview: null,
     previewToken: 0,
     installed: new Set(), // voice ids downloaded on this device
-    partial: new Map(), // voice id -> bytes of an unfinished download
     dl: null, // { id, ctrl, done, total }: a download in progress
     gpu: null, // WebGPU adapter present: true | false | null (not checked yet)
     offerShown: false,
@@ -1175,7 +1195,7 @@
       }
       // Android's engine caps an utterance's length and Chrome's online voices stop after
       // ~15 s, so a long segment is spoken in pieces.
-      tts.pieces = kit.system.chunkText(rest).map((c) => ({ start: from + c.start, end: from + c.end }));
+      tts.pieces = utterancePieces(rest).map((c) => ({ start: from + c.start, end: from + c.end }));
       tts.piece = 0;
       speakPiece(my);
       queuePositionSave();
@@ -2207,8 +2227,10 @@
       s.offeredVoice = true;
       saveSettings();
       const id = kitVoiceId(s.voiceMode);
-      const size = s.voiceMode === 'natural' ? '326 MB' : '63 MB';
-      toast(`For a natural voice that keeps reading with the screen off, download ${voiceName(id) === 'The voice' ? 'one' : voiceName(id)} (${size}, once).`, { action: 'Download', onAction: () => askDownload(id) });
+      const entry = kit.V && kit.V.findVoice(id);
+      const size = entry ? fmtMB(entry.bytes) : s.voiceMode === 'natural' ? '326 MB' : '63 MB';
+      const kind = s.voiceMode === 'natural' ? 'a natural voice' : 'a voice';
+      toast(`For ${kind} that keeps reading with the screen off, download ${entry ? entry.name : 'one'} (${size}, once).`, { action: 'Download', onAction: () => askDownload(id) });
     }, 2500);
   }
 
@@ -2783,7 +2805,7 @@
     fileNote = '';
     if (!files.length) return;
     if (!kit.K) {
-      toast('Readout is still starting. Try again in a moment.');
+      toast(kit.failed ? 'Opening files didn’t load. Reload Readout to try again.' : 'Readout is still starting. Try again in a moment.');
       return;
     }
     let last = null;
@@ -4482,6 +4504,7 @@
     bindEvents();
     setupMediaSession();
     const kitReady = loadKit();
+    kitReady.catch(() => {}); // handled below, once storage is open
     await store.init();
     let docs = [];
     let positions = [];
@@ -4521,8 +4544,9 @@
     try {
       await kitReady;
     } catch (e) {
+      // Texts, editing, dictation, sync and the device voice (line by line) still work.
       console.error('Readout: readkit failed to load', e);
-      throw e;
+      kit.failed = true;
     }
     loadVoices();
     renderLibrary();
@@ -4533,7 +4557,8 @@
     }
     window.__readout = { state, tts, dict, sync, editing, Core, au, kit, sleep, queue, chooseEngine, seekTo, setSleep };
     registerServiceWorker();
-    if (!tts.ok && !playerSupported()) toast('This browser can’t read aloud. Open Readout in Chrome.');
+    if (kit.failed) toast('Part of Readout didn’t load, so for now it can’t open files and reads line by line with the device voice. Reload to try again.');
+    else if (!tts.ok && !playerSupported()) toast('This browser can’t read aloud. Open Readout in Chrome.');
     if (store.memoryOnly) toast('This browser isn’t allowing storage, so texts won’t be saved.');
     refreshVoices().then(() => {
       renderRate();

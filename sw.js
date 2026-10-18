@@ -220,12 +220,15 @@ function isolated(res) {
   return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
 }
 
-// Pages: try the network so updates arrive, fall back to the cached app offline.
+// Pages: try the network so updates arrive, fall back to the cached app offline. Only the
+// app's own page is kept as './' (not a file in scope opened as a page, like the manifest).
 async function networkFirst(req) {
   const cache = await caches.open(SHELL_CACHE);
   try {
     const res = await fetch(req.url, { cache: 'no-cache', credentials: 'same-origin' });
-    if (res && res.ok && !res.redirected) cache.put('./', res.clone());
+    const path = new URL(req.url).pathname;
+    const app = path === scopeUrl().pathname || path === scopeUrl().pathname + 'index.html';
+    if (res && res.ok && !res.redirected && app && /text\/html/i.test(res.headers.get('Content-Type') || '')) cache.put('./', res.clone());
     return res;
   } catch (e) {
     return (await cache.match('./')) || (await cache.match('index.html')) || Response.error();

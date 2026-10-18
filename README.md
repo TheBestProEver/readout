@@ -4,6 +4,17 @@ Paste text or open a file and hear it read aloud, in a natural voice that keeps 
 
 **Use it:** https://thebestproever.github.io/readout/
 
+## New in 2.0
+
+- **Listen with the screen off.** The new natural voice (Michael, American, the default once downloaded) runs on your phone, so you can lock it and keep listening, with play/pause and next/previous on the lock screen. A smaller standard voice is there for phones that can't run the natural one. See [Voices](#voices) for the download sizes.
+- **Open almost any file**: PDFs (scanned ones too), photos of pages, Word, PowerPoint, OpenDocument, EPUB, RTF, web pages, Markdown, and text, without the running heads, page numbers, footnotes, and margin notes.
+- **Share files to Readout** from other Android apps (a PDF from your email, a document from Drive), not just text.
+- **Sleep timer**, **Play next text automatically**, **Headings and chapters**, **Pronunciations**, **Save audio**, and an **American or British** accent.
+- Smarter reading: numbers, dates, money, and abbreviations are said the way a person would, citations can be skipped, and the word being read is highlighted too.
+- The experimental "Try to keep reading when locked" setting is gone: the natural and standard voices do that properly now.
+
+Your texts, places, and sync carry over from 1.x as they are.
+
 ## On your phone
 
 1. Open the link in Chrome on Android.
@@ -59,16 +70,15 @@ How it behaves:
 - Deleting a text deletes it everywhere. Importing a backup that contains it brings it back.
 - Texts over 3 million characters stay on the device they're on.
 - Keep the sync key private: anyone with it can read and change your synced texts. If it leaks, delete the token on GitHub (Settings → Developer settings → Personal access tokens), make a new one, and paste it into Readout on each device.
+- The pronunciation list syncs too (in its own file in the gist, which versions before 2.0 leave alone).
 - **Turn off sync on this device** stops syncing. Your texts stay on the device.
-
-- With sync on, the pronunciation list syncs too (in its own file in the gist, which versions before 2.0 leave alone).
 
 ## Good to know
 
 - **Screen off:** the natural and standard voices keep reading with the screen off. The device voice can't: phones stop web speech when the screen locks, so Readout keeps the screen awake while the device voice reads (you can turn that off in Settings).
 - **Better device voices on Android:** open your phone's text-to-speech settings and install voice data for Google's speech engine. New voices show up in Readout's device voice list.
-- **Voice licences:** Michael and the other natural voices (Kokoro) are Apache-2.0. The standard voices are Piper voices: Ryan is CC BY-NC-SA 4.0 (non-commercial use), Alba is CC BY 4.0, and Cori is public domain.
-- **Privacy:** without sync, your texts never leave the browser. Files, scanned pages, and photos are read on your device, and the natural and standard voices run on your device too. The only downloads are pinned public files: the libraries Readout uses (from jsDelivr) and the voices (from Hugging Face), kept in the browser's storage. With sync on, your texts are also kept in a secret gist on your GitHub account. Secret gists are unlisted, not encrypted: anyone with the gist's address could read it, and GitHub keeps its edit history. Device voices marked "online" send the text to Google or Microsoft to synthesize it. Dictation in Chrome usually sends audio to Google to transcribe it, unless you turn on on-device recognition in Settings and your Chrome supports it.
+- **Voice licences:** Michael and the other natural voices (Kokoro) are Apache-2.0. The standard voices are Piper voices: Ryan is CC BY-NC-SA 4.0 (non-commercial use), Alba is CC BY 4.0, and Cori is public domain. The voices' phonemizer (espeak-ng, GPL-3.0) is downloaded from jsDelivr when a voice first runs; it isn't part of Readout.
+- **Privacy:** without sync, your texts never leave the browser. Files, scanned pages, and photos are read on your device, and the natural and standard voices run on your device too. The only downloads are pinned public files: the libraries Readout uses and the text recognition data (from jsDelivr), the voices (from Hugging Face), and the fonts (from Google Fonts), kept in the browser's storage. Nothing you read is sent with them. With sync on, your texts are also kept in a secret gist on your GitHub account. Secret gists are unlisted, not encrypted: anyone with the gist's address could read it, and GitHub keeps its edit history. Device voices marked "online" send the text to Google or Microsoft to synthesize it. Dictation in Chrome usually sends audio to Google to transcribe it, unless you turn on on-device recognition in Settings and your Chrome supports it.
 - Without sync, your texts live only in this browser on this device. Clearing the browser's site data deletes them, so turn on sync or export a backup now and then.
 
 ## Keyboard shortcuts (computer)
@@ -101,7 +111,7 @@ Tests (browser tests need Chrome or Edge and always run it headless with a tempo
 - `node tests/core.test.js`, `node tests/sync.test.js`: the text pipeline and the sync merge
 - `node tests/sync.e2e.mjs`: two browser "devices" syncing through a stand-in for GitHub's gist API
 - `node tests/pdf.e2e.mjs`: opening every kind of file, scanned PDFs and photos (needs the internet for pdf.js and Tesseract)
-- `node tests/v2.e2e.mjs [section,...]`: a scanned course reading, highlighting, the natural and standard voices playing for over a minute in a hidden page with Android's freezing rule, lock-screen controls, sleep timer, the share sheet, the service worker, and the phone layout. The voice sections use local model copies found through the `READKIT_SCRATCH` environment variable (see `tests/fixtures/servers.mjs`) and skip without them.
+- `node tests/v2.e2e.mjs [section,...]`: a scanned course reading, highlighting, the natural and standard voices playing for over a minute in a hidden page with Android's freezing rule, lock-screen controls, sleep timer, the share sheet, the service worker, the phone layout, what 1.x did (dictation, search, themes, install, backups), and Readout still working if readkit can't load. The voice sections use local model copies found through the `READKIT_SCRATCH` environment variable (see `tests/fixtures/servers.mjs`) and skip without them. With `READKIT_PRIVATE` pointing at a folder of your own PDFs, each `<name>.pdf` with a `<name>.golden.json` beside it (readkit's golden format) is opened in place and scored, and only numbers are printed.
 
 ## License
 
