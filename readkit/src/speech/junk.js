@@ -37,6 +37,8 @@ function symbolJunk(tok) {
 const LOOSE_ACCENT = /[¨¯¸˚˙˛˜˝ˆˇ˘]/;
 // A symbol inside a run of letters and digits: 'Xj3$k9#', 'a@1b'
 const INNER_SYMBOL = /[\p{L}\p{N}][$#%*~|][\p{L}\p{N}]/u;
+// ... but a prefixed dollar amount is money (rules/money.js reads it): 'US$5', 'C$20', 'HK$1.5bn'
+const PREFIXED_DOLLARS = /^(?:US|AU|A|CA|C|NZ|HK|S)\$(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:k|K|m|M|mn|mln|mil|bn|bln|b|B|tn|T)?(?:\/[a-z]+)?$/;
 
 export function isJunk(token) {
   const tok = String(token ?? '');
@@ -46,7 +48,7 @@ export function isJunk(token) {
   if (!/[\p{L}\p{N}]/u.test(core)) return symbolJunk(tok);
   if (/[{}[\]<>|\\^`~]/.test(core) && !okInner(core)) return true;
   if (LOOSE_ACCENT.test(core)) return true;
-  if (INNER_SYMBOL.test(core) && /\p{N}/u.test(core) && /\p{L}/u.test(core)) return true;
+  if (INNER_SYMBOL.test(core) && /\p{N}/u.test(core) && /\p{L}/u.test(core) && !PREFIXED_DOLLARS.test(core)) return true;
   if (/^(?:0x)?[0-9a-f]{12,}$/i.test(core) && /\d/.test(core) && /[a-f]/i.test(core)) return true;
   if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(core)) return true;
   // four or more letter/digit switches in one run: P23gf49y, a1b2c3d4, 0O0O0O

@@ -87,6 +87,93 @@ export function inkShare(canvas, scale, boxes = []) {
   return area ? ink / area : 0;
 }
 
+// Lines of print on a page whose ink share is too small to count (a chapter's last page:
+// one or two short lines on a scan). Print is rows of short dark strokes (letter stems),
+// a few pixels to a few dozen tall, running some way across the page; a rule or a logo is
+// one long run per row, specks and dust make no band of rows, and a scan's dark borders
+// and gutter shadow sit in the margin that is left out.
+// gray: luminance bytes (w x h); skip: optional bytes, 1 = ignore (text-layer boxes).
+// Returns [{ y0, y1, x0, x1, strokes }] in pixels.
+export function findPrintLines(gray, w, h, skip = null) {
+  const mx = Math.round(0.03 * w);
+  const my = Math.round(0.03 * h);
+  const maxRun = Math.max(4, Math.round(0.035 * w));
+  const n = new Int32Array(h);
+  const lo = new Int32Array(h).fill(w);
+  const hi = new Int32Array(h).fill(-1);
+  for (let y = my; y < h - my; y++) {
+    let run = 0;
+    for (let x = mx; x <= w - mx; x++) {
+      const i = y * w + x;
+      if (x < w - mx && gray[i] < 150 && !(skip && skip[i])) {
+        run++;
+        continue;
+      }
+      if (run && run <= maxRun) {
+        n[y]++;
+        if (x - run < lo[y]) lo[y] = x - run;
+        if (x > hi[y]) hi[y] = x;
+      }
+      run = 0;
+    }
+  }
+  const minH = Math.max(3, Math.round(0.003 * h));
+  const maxH = Math.round(0.08 * h);
+  const out = [];
+  for (let y = my; y < h - my; ) {
+    if (n[y] < 3) {
+      y++;
+      continue;
+    }
+    // a band: rows with strokes, a one-row break bridged
+    let end = y;
+    while (end + 1 < h - my && (n[end + 1] >= 2 || (end + 2 < h - my && n[end + 2] >= 3))) end++;
+    let strokes = 0;
+    let x0 = w;
+    let x1 = -1;
+    for (let k = y; k <= end; k++) {
+      strokes += n[k];
+      if (n[k] >= 2) {
+        if (lo[k] < x0) x0 = lo[k];
+        if (hi[k] > x1) x1 = hi[k];
+      }
+    }
+    const rows = end - y + 1;
+    if (rows >= minH && rows <= maxH && strokes >= 3 * rows && x1 - x0 >= 0.03 * w) out.push({ y0: y, y1: end + 1, x0, x1, strokes });
+    y = end + 1;
+  }
+  return out;
+}
+
+// findPrintLines on a rendered page, leaving out text-layer boxes (page points).
+export function printLines(canvas, scale, boxes = []) {
+  const k = Math.min(1, 1200 / Math.max(canvas.width, canvas.height));
+  const w = Math.max(1, Math.round(canvas.width * k));
+  const h = Math.max(1, Math.round(canvas.height * k));
+  const small = makeCanvas(w, h);
+  const ctx = small.getContext('2d', { willReadFrequently: true });
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, w, h);
+  ctx.drawImage(canvas, 0, 0, w, h);
+  const px = ctx.getImageData(0, 0, w, h).data;
+  freeCanvas(small);
+  const gray = new Uint8Array(w * h);
+  for (let i = 0, j = 0; j < gray.length; i += 4, j++) gray[j] = 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2];
+  let skip = null;
+  if (boxes.length) {
+    skip = new Uint8Array(w * h);
+    const f = scale * k;
+    for (const b of boxes) {
+      const x0 = Math.max(0, Math.floor(b.x0 * f) - 1);
+      const x1 = Math.min(w, Math.ceil(b.x1 * f) + 1);
+      const y0 = Math.max(0, Math.floor(b.top * f) - 1);
+      const y1 = Math.min(h, Math.ceil(b.bot * f) + 1);
+      for (let y = y0; y < y1; y++) skip.fill(1, y * w + x0, y * w + Math.max(x0, x1));
+    }
+  }
+  return findPrintLines(gray, w, h, skip);
+}
+
 // The paper's shade along the edges of a w x h area at (x, y) of a 2D context: the light
 // end of the edge pixels (ink touching the edge is dark). Returns a CSS colour.
 export function paperShade(ctx, x, y, w, h) {

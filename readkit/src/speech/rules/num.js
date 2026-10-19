@@ -47,8 +47,23 @@ export function europeanNumbers(t) {
   return t;
 }
 
+// '100s of people', '1,000s of birds', '10,000s of dollars': informal plurals of round numbers
+// (not seconds, not a decade). Only before 'of' and a plural, so 'a timeout of 100s', 'the
+// first 10s of the video' and 'the 1900s' are left to the other rules.
+const ROUND_PLURAL = /(?<![\w.,$£€¥#])(1|10|100)((?:,?000)*)s(?=\s+of\s+(?:[a-z]+s|people|men|women|children|staff|cattle)\b)/g;
+const BIG = ['', 'thousands', 'millions', 'billions'];
+
 export function decadeRules(t, ctx) {
   if (!/0['’]?s/.test(t.s)) return t;
+  if (/0s\s+of\s/.test(t.s)) {
+    t.replace(ROUND_PLURAL, (m) => {
+      const k = m[2].replace(/,/g, '').length / 3;
+      if (k > 3 || (m[2] && !/^(?:,000)+$|^(?:000)+$/.test(m[2]))) return null;
+      const big = BIG[k];
+      if (m[1] === '1') return k ? big : null;
+      return (m[1] === '10' ? 'tens' : 'hundreds') + (k ? ' of ' + big : '');
+    });
+  }
   t.replace(/(?<![\w.,])(1\d|20)(\d)0['’]?s(?![\w'’])/g, (m) => pluralWords(year(m[1] + m[2] + '0', ctx.uk)));
   t.replace(/(?<![\w.,'’])['’]?([1-9])0['’]?s(?![\w'’])/g, (m) => pluralWords(under100(+m[1] * 10)));
   return t;
@@ -159,7 +174,8 @@ export function magnitudeRules(t, ctx) {
   return t;
 }
 
-const CODE = /(?<![\w.\-'’])(?=[A-Za-z0-9-]*\d)(?=[A-Za-z0-9-]*[A-Za-z])[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*(?:\.\d+)?(?![\w\-'’])/g;
+// not the tail of a comma-grouped number ('5,000-word')
+const CODE = /(?<![\w.\-'’])(?<!\d,)(?=[A-Za-z0-9-]*\d)(?=[A-Za-z0-9-]*[A-Za-z])[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*(?:\.\d+)?(?![\w\-'’])/g;
 
 export function codeRules(t, ctx) {
   // lettered sections: 'Appendix B.2', 'A.1.3' -> 'B point two'
@@ -187,7 +203,8 @@ export function codeRules(t, ctx) {
 
 export function ratioRules(t, ctx) {
   if (!/\d:\d/.test(t.s)) return t;
-  t.replace(/(?<![\w.:])(\d+):(\d+)(?![\w:]|\.\d)/g, (m) => `${cardinal(m[1], ctx.uk)} to ${cardinal(m[2], ctx.uk)}`);
+  // '1:100,000' (map scales): the second number may have thousands groups
+  t.replace(/(?<![\w.:])(\d+):(\d{1,3}(?:,\d{3})+|\d+)(?![\w:]|\.\d)/g, (m) => `${cardinal(m[1], ctx.uk)} to ${cardinal(m[2].replace(/,/g, ''), ctx.uk)}`);
   return t;
 }
 

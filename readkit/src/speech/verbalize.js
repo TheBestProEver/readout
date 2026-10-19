@@ -60,19 +60,21 @@ export function makeContext(opts = {}) {
     words: opts.words,
     dropped: opts.dropped || [],
     saved: [],
+    savedFrom: [], // the words the saved texts replaced ('Patel' for 'Puh-tell'), for rules that look at names
   };
 }
 
-function protect(ctx, text) {
+function protect(ctx, text, from) {
   ctx.saved.push(text);
+  ctx.savedFrom.push(from);
   return String.fromCharCode(PUA + ctx.saved.length - 1);
 }
 
 function lexiconRules(t, ctx) {
   const lex = ctx.lexicon;
   if (!lex) return t;
-  if (lex.exactRe) t.replace(lex.exactRe, (m) => protect(ctx, lex.exact.get(m[0])));
-  if (lex.looseRe) t.replace(lex.looseRe, (m) => protect(ctx, lex.loose.get(m[0].toLowerCase())));
+  if (lex.exactRe) t.replace(lex.exactRe, (m) => protect(ctx, lex.exact.get(m[0]), m[0]));
+  if (lex.looseRe) t.replace(lex.looseRe, (m) => protect(ctx, lex.loose.get(m[0].toLowerCase()), m[0]));
   return t;
 }
 
@@ -161,6 +163,7 @@ export function tidy(t) {
 export function verbalizeTracked(t, opts) {
   const ctx = makeContext(opts);
   ctx.saved = [];
+  ctx.savedFrom = [];
   cleanTracked(t, { footnoteMarks: ctx.skip.footnoteMarks, words: ctx.words });
   skipRules(t, ctx);
   junkTracked(t, ctx.dropped);

@@ -10,6 +10,7 @@ import { domToBlocks } from './dom.js';
 import { markReferences } from '../doc.js';
 import { stripHtml } from './html.js';
 import { usefulTitle } from './opc.js';
+import { MAX_TEXT } from './zip.js';
 
 const FONT_OBFUSCATION = /^(?:http:\/\/www\.idpf\.org\/2008\/embedding|http:\/\/ns\.adobe\.com\/pdf\/enc#RC)$/;
 const local = (n) => n.name.slice(n.name.indexOf(':') + 1);
@@ -90,7 +91,15 @@ export async function readEpub(zip, ctx) {
 
   const blocks = [];
   let chapter = 0;
-  const read = (path) => (drm.parts.has(path) ? Promise.resolve(null) : zip.bytes(path).catch(() => null));
+  // (a part too big to read safely is left out and said so; any other failure skips the part)
+  let big = 0;
+  const read = (path) =>
+    drm.parts.has(path)
+      ? Promise.resolve(null)
+      : zip.bytes(path, MAX_TEXT).catch((e) => {
+          if (e && e.code === 'too-large') big++;
+          return null;
+        });
   let next = spine.length ? read(spine[0]) : null;
   for (let k = 0; k < spine.length; k++) {
     if (c.onProgress) c.onProgress({ stage: 'parse', done: k, total: spine.length, message: `Reading part ${k + 1} of ${spine.length}` });
@@ -123,5 +132,6 @@ export async function readEpub(zip, ctx) {
     if (c.onBlocks) c.onBlocks(got);
   }
   if (!blocks.length && drm.marked && drm.parts.size) return { title, blocks: [], warnings: [{ type: 'drm', text: DRM_TEXT }], pages: 0, refused: 'drm' };
+  if (big) warnings.push({ type: 'truncated', text: `${big} of the ${spine.length} parts of this book unpack to more data than can be read safely and were left out.` });
   return { title, blocks, warnings, pages: chapter, images: c.images || [] };
 }

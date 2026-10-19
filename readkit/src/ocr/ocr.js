@@ -15,6 +15,7 @@
 // has a stall timer and rejects.
 
 import { config } from '../config.js';
+import { userError } from '../formats/util.js';
 import { loadWords } from '../lang/words.js';
 import { core, isKnown, isNumberish, isCode } from '../lang/tokens.js';
 import { createCorrector } from '../lang/correct.js';
@@ -22,6 +23,8 @@ import { layoutParagraphs, splitLines, headingLevel, skewOf, BULLET, median } fr
 import { createPrep } from './prep.js';
 import { toPGM } from './pre.js';
 import { moduleWorker } from '../worker.js';
+import { atomsFromOcr } from '../layout/layout.js';
+import { panels as findPanels, underlines } from '../layout/surface.js';
 
 // What the first use downloads: Tesseract core + worker + English model, and the
 // correction word pairs (the word list is shared with the PDF reader).
@@ -51,6 +54,23 @@ function loadTesseract() {
 
 const abortError = () => new DOMException('The operation was aborted', 'AbortError');
 const isAbort = (e) => e && e.name === 'AbortError';
+
+// A Content Security Policy without 'wasm-unsafe-eval' (a Chrome extension's
+// content_security_policy, or a site's own) stops all WebAssembly, so Tesseract can never
+// start. Found at once with a tiny module, and said plainly: not after the 60 s setup stall,
+// and not as 'the file may be damaged'.
+export const CSP_BLOCKED = 'Text in pictures can’t be read here: the Content Security Policy of this page or extension blocks WebAssembly, which OCR needs. A Chrome extension must allow it by adding \'wasm-unsafe-eval\' to script-src in its manifest’s content_security_policy (extension_pages).';
+const CSP_WORDS = /Content Security Policy|wasm-unsafe-eval|unsafe-eval|\bCSP\b/i;
+export function wasmBlocked() {
+  if (typeof WebAssembly === 'undefined' || typeof WebAssembly.Module !== 'function') return false;
+  try {
+    new WebAssembly.Module(new Uint8Array([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0]));
+    return false;
+  } catch (e) {
+    return CSP_WORDS.test(String((e && e.message) || e));
+  }
+}
+const cspError = (cause) => userError(CSP_BLOCKED, 'ocr-blocked', cause);
 
 // Runs start(alive, fail) and settles with it, or rejects on fail(), on abort, or
 // when alive() hasn't been called for stallMs.
@@ -445,6 +465,7 @@ function replaceLines(res, drop, add) {
 /* ---------- createOcr ---------- */
 
 export async function createOcr({ signal, onProgress, stallMs = SETUP_STALL_MS, recognizeStallMs = RECOGNIZE_STALL_MS } = {}) {
+  if (wasmBlocked()) throw cspError();
   const T = await guarded(() => loadTesseract(), { signal, stallMs, what: 'Loading OCR' });
   const dict = await loadWords();
   const hooks = { alive: null, fail: null, progress: onProgress };
@@ -516,7 +537,10 @@ export async function createOcr({ signal, onProgress, stallMs = SETUP_STALL_MS, 
           starting = null;
           // a worker that turns up after we gave up must not linger
           if (created) created.then((w) => w.terminate().catch(() => {}), () => {});
-          throw isAbort(e) ? e : new Error("Couldn't start the OCR engine: " + e.message);
+          if (isAbort(e)) throw e;
+          // (the worker's own policy refused the engine: 'Refused to compile ... unsafe-eval')
+          if (CSP_WORDS.test(String(e && e.message)) || wasmBlocked()) throw cspError(e);
+          throw new Error("Couldn't start the OCR engine: " + e.message);
         }
       );
     }
@@ -584,6 +608,45 @@ export async function createOcr({ signal, onProgress, stallMs = SETUP_STALL_MS, 
     return { res: out, filled: add.lines.length };
   }
 
+  // Display text far larger than the rest of the page (a poster's '30', a stacked 'OCT'):
+  // Tesseract misses glyphs much over 100 px tall, and the letter map leaves them out, so the
+  // prepared page is read once more at a third of its size. Words found there that are big,
+  // read with confidence and nowhere near a word already read are added.
+  async function bigPass(res, p, sig) {
+    let piece;
+    try {
+      piece = await prep.prep(p, /raw/.test(res.method || '') ? 'small-raw' : 'small');
+    } catch (e) {
+      return res;
+    }
+    if (piece.w < 48 || piece.h < 48) return res;
+    const got = parse(await tess(piece.pgm, { tessedit_pageseg_mode: '11' }, sig), piece);
+    const hs = res.words.map((w) => w.bbox.y1 - w.bbox.y0).sort((a, b) => a - b);
+    const med = hs.length ? hs[hs.length >> 1] : 0;
+    const hit = (a, b) => a.x0 < b.x1 && b.x0 < a.x1 && a.y0 < b.y1 && b.y0 < a.y1;
+    const keep = got.words.filter((w) => {
+      const h = w.bbox.y1 - w.bbox.y0;
+      // (a month, a weekday or a number in big type reads with less confidence and is still right)
+      const dateWord = /^(?:\d{1,4}(?:st|nd|rd|th)?|jan|feb|mar|apr|may|jun|jul|aug|sept?|oct|nov|dec|mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?$/i.test(w.text);
+      if (w.conf < (dateWord ? 0.4 : 0.7) || h < Math.max(2.2 * med, 50)) return false;
+      if (!/[\p{L}\p{N}]{2}|^\p{N}$/u.test(w.text) || /[^\p{L}\p{N}'’.,:/&-]/u.test(w.text)) return false;
+      // (a speck read as '[H]' where the big letters are does not count as reading them)
+      return !res.words.some((o) => o.conf >= 0.5 && /[\p{L}\p{N}]{2}/u.test(o.text) && hit(o.bbox, w.bbox));
+    });
+    if (!keep.length) return res;
+    const add = { lines: [], words: [] };
+    const used = [...new Set(keep.map((w) => w.line))];
+    used.forEach((li, k) => {
+      const ws = keep.filter((w) => w.line === li).sort((a, b) => a.bbox.x0 - b.bbox.x0);
+      add.lines.push({ ...got.lines[li], text: ws.map((w) => w.text).join(' ') });
+      for (const w of ws) add.words.push({ ...w, line: k });
+    });
+    const out = replaceLines(res, new Set(), add);
+    out.judge = res.judge;
+    out.method = res.method;
+    return out;
+  }
+
   // Calls are queued: one Tesseract worker, one image at a time.
   let queue = Promise.resolve();
   const serial = (fn) => {
@@ -628,6 +691,13 @@ export async function createOcr({ signal, onProgress, stallMs = SETUP_STALL_MS, 
           if (clearlyGood(best.judge)) break;
           // a clearly skewed page is turned before anything else is tried
           if (k === 0) rungs.push(...(Math.abs(skew) >= 2 * SKEWED ? [LADDER[2], LADDER[1]] : [LADDER[1], LADDER[2]]));
+        }
+        // posters and screenshots: display text too big to read (a stacked '30', 'OCT')
+        if (kind !== 'scan' || best.words.length < 80) {
+          const t3 = Date.now();
+          const before = best.words.length;
+          best = await bigPass(best, p, sig);
+          passes.push({ piece: p, method: 'big', ms: Date.now() - t3, added: best.words.length - before });
         }
         const off = all.lines.length;
         all.lines.push(...best.lines);
@@ -745,9 +815,33 @@ function prepareWords(result, dict) {
   return { lines, words };
 }
 
+// A phone screenshot's status bar (clock, network, battery: '12:41 5G 87%') and a browser's
+// address bar ('nytimes.com/2026/10/16/science/bridges.html') at the top of a tall picture:
+// the phone's, not the page's text. Bands measured against the width (a status bar is about
+// 7% of a phone's width tall, with the address bar under it about 20%), so a long scrolling
+// screenshot's headline is never in them.
+const CLOCKISH = /^(?:\d{1,2}:\d{2}|\d{1,3}%)$/;
+const STATUS_TOKEN = /^(?:\d{1,2}:\d{2}|\d{1,3}%|[2-5]G\+?|5G[A-Z]{0,3}|LTE\+?|VoLTE|Vo|Wi-?Fi|H\+?|E|\S{1,2})$/i;
+const URLISH = /^(?:https?:\/\/)?(?:www\.)?[\w-]+(?:\.[\w-]+)*\.[a-z]{2,}(?:[/?#]\S*)?$/i;
+export function phoneChrome(lines, lineWords, screen) {
+  const out = new Set();
+  if (!screen || !(screen.height > 1.6 * screen.width)) return out;
+  for (const [i, ws] of lineWords) {
+    const b = lines[i] && lines[i].bbox;
+    if (!b || !ws.length) continue;
+    const toks = ws.map((w) => String(w.text));
+    if (b.y1 <= 0.12 * screen.width && toks.every((t) => STATUS_TOKEN.test(t)) && toks.some((t) => CLOCKISH.test(t))) out.add(i);
+    else if (b.y1 <= 0.25 * screen.width && toks.length <= 3 && toks.some((t) => URLISH.test(t) && /[./]/.test(t)) && toks.every((t) => URLISH.test(t) || t.length <= 2)) out.add(i);
+  }
+  return out;
+}
+
 // OCR result -> Blocks, corrected. Exported for the PDF reader's scanned pages.
 //   corrector: from createCorrector() (optional; without it nothing is corrected or dropped)
-export async function ocrBlocks(result, { corrector, page = 1 } = {}) {
+//   layout: also return the corrected words line by line (`lines`, for src/layout)
+//   screen: { width, height } of a picture that may be a phone screenshot (its status and
+//   address bars become skipped 'header' blocks)
+export async function ocrBlocks(result, { corrector, page = 1, layout = false, screen = null } = {}) {
   const dict = await loadWords();
   const { lines, words } = prepareWords(result, dict);
   const live = words.filter((w) => !w.skip);
@@ -755,7 +849,7 @@ export async function ocrBlocks(result, { corrector, page = 1 } = {}) {
   let dropped = [];
   if (corrector && live.length) {
     const r = await corrector.correctWords(live);
-    fixed = r.words;
+    fixed = r.words.map((w, k) => (w.changed ? { ...w, raw: live[k].text } : w));
     dropped = r.dropped;
   }
   const lineWords = new Map();
@@ -764,16 +858,23 @@ export async function ocrBlocks(result, { corrector, page = 1 } = {}) {
     if (!lineWords.has(w.line)) lineWords.set(w.line, []);
     lineWords.get(w.line).push(w);
   }
+  // a phone's status and address bars: kept as skipped headers, out of the paragraphs
+  const chrome = phoneChrome(lines, lineWords, screen);
+  const blocks = [];
+  let low = 0;
+  let count = 0;
+  for (const i of [...chrome].sort((a, b) => lines[a].bbox.y0 - lines[b].bbox.y0)) {
+    const ws = lineWords.get(i);
+    count += ws.length; // (words read, as the other blocks' are)
+    blocks.push({ type: 'p', text: ws.map((w) => w.text).join(' '), page, source: 'ocr', conf: Math.round((ws.reduce((a, w) => a + w.conf, 0) / ws.length) * 1000) / 1000, skip: 'header' });
+  }
   // geometry again, with the corrected text
-  const paras = layoutParagraphs(lines, (i) => (lineWords.has(i) ? { text: lineWords.get(i).map((w) => w.text).join(' '), bullet: lines[i].bullet } : null));
+  const paras = layoutParagraphs(lines, (i) => (lineWords.has(i) && !chrome.has(i) ? { text: lineWords.get(i).map((w) => w.text).join(' '), bullet: lines[i].bullet } : null));
   const order = paras.flatMap((p) => p.lines);
   const sizes = [];
   for (const s of order) for (let k = 0; k < lineWords.get(s.i).length; k++) sizes.push(s.size);
   const body = median(sizes);
   const maxSize = Math.max(0, ...order.map((s) => s.size));
-  const blocks = [];
-  let low = 0;
-  let count = 0;
   for (const para of paras) {
     const ws = para.lines.flatMap((s) => lineWords.get(s.i));
     const text = para.lines
@@ -794,7 +895,28 @@ export async function ocrBlocks(result, { corrector, page = 1 } = {}) {
     const type = para.bullet ? 'li' : level ? 'h' + level : 'p';
     blocks.push({ type, text, page, source: 'ocr', conf: Math.round(conf * 1000) / 1000 });
   }
-  return { blocks, dropped, stats: { words: count, lowConfidenceWords: low, droppedTokens: dropped.length } };
+  const out = { blocks, dropped, stats: { words: count, lowConfidenceWords: low, droppedTokens: dropped.length } };
+  if (layout) {
+    // Every line, in reading order, with its corrected words. Numbers, dashes and am/pm the
+    // corrector dropped as junk (they are not read aloud) stay here with their raw text:
+    // '6 PM = 9 PM' read with little confidence is still a time range on a flyer.
+    const all = new Map();
+    fixed.forEach((w, k) => {
+      if (chrome.has(w.line)) return; // (the status bar's clock is no event time)
+      const raw = live[k].text;
+      let keep = !w.dropped && w.text;
+      let x = w;
+      if (!keep && (/\d|^[-–—=~]+$|^[ap]\.?m\.?$/i.test(raw) || /^(?:M|Tu|T|W|Th|R|F|Sa|Su)(?:[/,&]?(?:M|Tu|T|W|Th|R|F|Sa|Su)){1,6}$/.test(raw) || /^(?:jan|feb|mar|apr|may|jun|jul|aug|sept?|oct|nov|dec|mon|tues?|wed|thur?s?|fri|sat|sun)[a-z]*[.,]?$/i.test(raw))) {
+        keep = true;
+        x = { ...w, text: raw, dropped: true };
+      }
+      if (!keep) return;
+      if (!all.has(w.line)) all.set(w.line, []);
+      all.get(w.line).push(x);
+    });
+    out.lines = lines.map((l, i) => ({ size: l.size, words: (all.get(i) || []).sort((a, b) => a.bbox.x0 - b.bbox.x0) })).filter((l) => l.words.length);
+  }
+  return out;
 }
 
 /* ---------- ocrImage ---------- */
@@ -808,6 +930,35 @@ async function sniffKind(blob) {
   }
   // Lossless formats are almost always screenshots; camera photos are JPEG/HEIC.
   return /png|gif|bmp|webp/.test(type) ? 'screenshot' : 'photo';
+}
+
+// The picture's pixels, for the layout: flat panels (an overlay among them) and the bar under
+// each word, in OCR coordinates. Marks words with `ul`; returns { panels } (null if the
+// pixels can't be read here).
+function readSurface(bitmap, lines, ocrWidth) {
+  try {
+    const W = bitmap.width;
+    const H = bitmap.height;
+    const k = Math.min(1, 2400 / Math.max(W, H));
+    const w = Math.max(1, Math.round(W * k));
+    const h = Math.max(1, Math.round(H * k));
+    const canvas = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(w, h) : Object.assign(document.createElement('canvas'), { width: w, height: h });
+    const g = canvas.getContext('2d', { willReadFrequently: true });
+    g.drawImage(bitmap, 0, 0, w, h);
+    const img = g.getImageData(0, 0, w, h);
+    const s = w / (ocrWidth || W);
+    const scale = (b, f) => ({ x0: b.x0 * f, y0: b.y0 * f, x1: b.x1 * f, y1: b.y1 * f });
+    const ps = findPanels(img).map((p) => ({ box: scale(p.box, 1 / s), overlay: p.overlay }));
+    const words = (lines || []).flatMap((l) => l.words || []).filter((x) => x.bbox);
+    const bars = underlines(img, words.map((x) => scale(x.bbox, s)));
+    words.forEach((x, i) => {
+      const b = bars[i];
+      if (b) x.ul = { y: b.y / s, x0: b.x0 / s, x1: b.x1 / s };
+    });
+    return { panels: ps };
+  } catch (e) {
+    return null;
+  }
 }
 
 const titleFrom = (name) => (name ? String(name).replace(/\.[a-z0-9]{2,5}$/i, '').trim() : '');
@@ -846,19 +997,27 @@ export async function ocrImage(blob, opts = {}) {
     result = await ocr.recognize(bitmap, { kind, signal });
     corrector = await correctorP;
     if (signal && signal.aborted) throw abortError();
-    const out = await ocrBlocks(result, { corrector, page: 1 });
+    const out = await ocrBlocks(result, { corrector, page: 1, layout: !!opts.layout, screen: { width: bitmap.width, height: bitmap.height } });
     stats.ocrPages = 1;
     stats.words = out.stats.words;
     stats.lowConfidenceWords = out.stats.lowConfidenceWords;
     stats.droppedTokens = out.stats.droppedTokens;
-    if (!out.blocks.length) warnings.push({ type: 'ocr-low-confidence', page: 1, text: 'No text was found in the picture.' });
+    const readable = out.blocks.filter((b) => !b.skip); // (not a status bar)
+    if (!readable.length) warnings.push({ type: 'ocr-low-confidence', page: 1, text: 'No text was found in the picture.' });
     else if (result.conf < 0.6) warnings.push({ type: 'ocr-low-confidence', page: 1, text: 'The text was hard to read, so some words may be wrong.' });
     for (const t of out.dropped.slice(0, 100)) warnings.push({ type: 'dropped-token', page: 1, text: t });
     if (!title) {
-      const h = out.blocks.find((b) => b.type[0] === 'h') || out.blocks[0];
+      const h = readable.find((b) => b.type[0] === 'h') || readable[0];
       title = h ? h.text.split(' ').slice(0, 8).join(' ').replace(/[.,;:]$/, '') : 'Picture';
     }
-    return { title, blocks: out.blocks, warnings, stats, method: result.method, conf: result.conf };
+    const res = { title, blocks: out.blocks, warnings, stats, method: result.method, conf: result.conf };
+    // opts.layout: the words where they are on the picture, for src/layout
+    if (opts.layout) {
+      // a screenshot's panels and the bars under its words (src/layout/surface.js)
+      const surface = kind === 'screenshot' ? readSurface(bitmap, out.lines, result.width || bitmap.width) : null;
+      res.layout = { pages: [{ page: 1, width: result.width || bitmap.width, height: result.height || bitmap.height, unit: 'px', source: 'ocr', atoms: atomsFromOcr(out.lines), panels: surface ? surface.panels : [] }] };
+    }
+    return res;
   } finally {
     if (bitmap.close) bitmap.close();
     if (ocr) ocr.terminate();

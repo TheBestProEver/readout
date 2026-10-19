@@ -4,19 +4,32 @@ readkit itself is MIT licensed (see `LICENSE`, copyright 2026 Arnav Rai). It inc
 third-party data, and it loads some third-party code and models at runtime. Those parts keep
 their own licences, listed here. This is a record of sources, not legal advice.
 
+The licence texts for the data included are in `LICENSES/`: `Apache-2.0.txt` (the Apache
+License, Version 2.0, for the misaki lexicons, the NeMo-derived tables and Kokoro's vocabulary),
+`SymSpell-MIT.txt` (SymSpell's copyright and permission notice) and `en-lexicon-MIT.txt`
+(en-lexicon's). Copies of readkit (`tools/copy-into.mjs`, `tools/vendor.mjs`) carry them with
+this file.
+
 ## Data included in this repository
 
 | Files | What | Source | Licence |
 |---|---|---|---|
-| `data/g2p/lex-us.txt`, `lex-gb.txt`, `pos-us.json`, `pos-gb.json` | misaki US and GB gold + silver pronunciation lexicons, repacked (`data/g2p/build/lex.mjs`, proven entry-for-entry equivalent) | [hexgrad/misaki](https://github.com/hexgrad/misaki) `misaki/data/{us,gb}_{gold,silver}.json` at commit `fba1236595f2d2bf21d414ba6e57d25256afada3` | Apache-2.0, copyright hexgrad |
-| `data/g2p/tags.txt` | most likely part-of-speech tags of 30,000 frequent words | [en-lexicon](https://www.npmjs.com/package/en-lexicon) 1.0.11 by Alex Corvi, built on Eric Brill's tagger lexicon | MIT |
+| `data/g2p/lex-us.txt`, `lex-gb.txt`, `pos-us.json`, `pos-gb.json` | misaki US and GB gold + silver pronunciation lexicons, repacked (`data/g2p/build/lex.mjs`, proven entry-for-entry equivalent) | [hexgrad/misaki](https://github.com/hexgrad/misaki) `misaki/data/{us,gb}_{gold,silver}.json` at commit `fba1236595f2d2bf21d414ba6e57d25256afada3` | Apache-2.0 (`LICENSES/Apache-2.0.txt`), copyright hexgrad; repacked, not changed in content |
+| `data/g2p/tags.txt` | most likely part-of-speech tags of 30,000 frequent words | [en-lexicon](https://www.npmjs.com/package/en-lexicon) 1.0.11 by Alex Corvi, built on Eric Brill's tagger lexicon | MIT, copyright 2017 Alex Corvi (`LICENSES/en-lexicon-MIT.txt`) |
 | `data/g2p/hetero.json` | heteronym senses and overrides; its `ipa` table is espeak-ng output (program output, not espeak-ng code) | readkit | MIT |
-| `data/lang/words-en.txt` | 95,395 English words with frequencies (US + UK spellings) | union of SymSpell `frequency_dictionary_en_82_765.txt` and SymSpell.FrequencyDictionary `en-80k.txt` ([wolfgarbe/SymSpell](https://github.com/wolfgarbe/SymSpell)) | MIT, copyright Wolf Garbe |
-| `data/lang/bigrams-en.txt` | word-pair counts for OCR correction, filtered and quantized | SymSpell `frequency_bigramdictionary_en_243_342.txt` (derived by SymSpell from Google Books Ngram counts) | MIT, copyright Wolf Garbe |
-| `data/speech/abbreviations.js`, `units.js`, `roman.js`, `symbols.js` | verbalizer rule tables; parts adapted (re-grouped, extended) | [NVIDIA NeMo-text-processing](https://github.com/NVIDIA/NeMo-text-processing) `en/data/` TSV files (commits in `data/speech/README.md`) | Apache-2.0, copyright NVIDIA Corporation (adapted parts); MIT (readkit's additions) |
+| `data/lang/words-en.txt` | 95,395 English words with frequencies (US + UK spellings) | union of SymSpell `frequency_dictionary_en_82_765.txt` and SymSpell.FrequencyDictionary `en-80k.txt` ([wolfgarbe/SymSpell](https://github.com/wolfgarbe/SymSpell)); the counts derived by SymSpell from Google Books Ngram data | MIT, copyright 2018 Wolf Garbe (`LICENSES/SymSpell-MIT.txt`); the counts CC BY 3.0 (Google Books Ngram, see below) |
+| `data/lang/bigrams-en.txt` | word-pair counts for OCR correction, filtered and quantized | SymSpell `frequency_bigramdictionary_en_243_342.txt` (derived by SymSpell from Google Books Ngram counts) | MIT, copyright 2018 Wolf Garbe (`LICENSES/SymSpell-MIT.txt`); the counts CC BY 3.0 (Google Books Ngram, see below) |
+| `data/speech/abbreviations.js`, `units.js`, `roman.js`, `symbols.js` | verbalizer rule tables; parts adapted (re-grouped, extended) | [NVIDIA NeMo-text-processing](https://github.com/NVIDIA/NeMo-text-processing) `en/data/` TSV files (commits in `data/speech/README.md`) | Apache-2.0 (`LICENSES/Apache-2.0.txt`), copyright NVIDIA Corporation (adapted parts: re-grouped and extended); MIT (readkit's additions) |
 | `data/speech/acronyms.js` | words read as words vs spelled | readkit | MIT |
-| `src/voice/kokoro-text.js` `VOCAB` | Kokoro's phoneme vocabulary | `hexgrad/Kokoro-82M` `config.json` | Apache-2.0 |
+| `src/voice/kokoro-text.js` `VOCAB` | Kokoro's phoneme vocabulary | `hexgrad/Kokoro-82M` `config.json` | Apache-2.0 (`LICENSES/Apache-2.0.txt`) |
 | `lab/passage.txt` | Chapter 5 of *Frankenstein* by Mary Shelley (1818), for the lab's screen-off test | Project Gutenberg #84 | public domain |
+
+Google Books Ngram: the word and word-pair counts in `data/lang/words-en.txt` and
+`data/lang/bigrams-en.txt` are derived from the Google Books Ngram dataset by Google
+(https://books.google.com/ngrams), licensed under the Creative Commons Attribution 3.0 Unported
+License (CC BY 3.0, https://creativecommons.org/licenses/by/3.0/), by way of SymSpell's frequency
+dictionaries. readkit changed them: two word lists merged and kept to lowercase words, the pairs
+filtered and quantized (see `data/lang/README.md`).
 
 Provenance note on misaki: the misaki lexicons are published by hexgrad under Apache-2.0; where
 their entries were originally drawn from is an open question upstream (hexgrad/misaki issue

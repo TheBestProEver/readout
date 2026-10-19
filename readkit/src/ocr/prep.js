@@ -90,6 +90,13 @@ export function createPrep() {
           cache.text[i + 1] = t[i + 1] / base + y0;
         }
       }
+      // 'small': the prepared image at a third of its size, for display text too big to read
+      // ('small-raw': the plain image, when the plain reading did better)
+      if (mode === 'small' || mode === 'small-raw') {
+        const a = mode === 'small' ? cache.auto : { g, w, h, scale: 1 };
+        const s = scaled(a.g, a.w, a.h, mode === 'small' ? 1 / 3 : cache.auto.scale / 3);
+        return { pgm: toPGM(s.g, s.w, s.h), w: s.w, h: s.h, scale: base * a.scale * s.scale, y0, info: { ...cache.auto.info, base }, text: new Float32Array(0) };
+      }
       const out = mode === 'raw' ? scaled(g, w, h, cache.auto.scale) : cache.auto;
       return { pgm: toPGM(out.g, out.w, out.h), w: out.w, h: out.h, scale: base * out.scale, y0, info: { ...cache.auto.info, base }, text: cache.text.slice() };
     },

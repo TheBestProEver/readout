@@ -12,7 +12,14 @@ const END = 0x06054b50;
 const END64 = 0x06064b50;
 const LOC64 = 0x07064b50;
 const DESC = 0x08074b50;
-const MAX_ENTRY = 512 * 1024 * 1024; // a guard against zip bombs
+// Guards against zip bombs: an entry (a picture may be big), an XML or XHTML part (read as
+// text: a real document's is far smaller), everything one archive inflates, and how far an
+// entry may inflate past 32 MB (deflate reaches ~1000:1 on repeated XML; real parts ~10:1).
+const MAX_ENTRY = 512 * 1024 * 1024;
+export const MAX_TEXT = 128 * 1024 * 1024;
+const MAX_TOTAL = 512 * 1024 * 1024;
+const RATIO_FREE = 32 * 1024 * 1024;
+const MAX_RATIO = 200;
 const MAX_SCAN = 256 * 1024 * 1024;
 
 const view = (u8) => new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
@@ -201,8 +208,11 @@ function concat(chunks, total) {
   return out;
 }
 
-// Inflates raw deflate data. A damaged or cut-off stream returns what could be read.
-export async function inflateRaw(data, max = MAX_ENTRY) {
+const tooLarge = () => userError('This file unpacks to more data than can be read safely.', 'too-large');
+
+// Inflates raw deflate data. A damaged or cut-off stream returns what could be read. size: the
+// inflated size when known, so the data goes straight into one buffer (not chunks, then a copy).
+export async function inflateRaw(data, max = MAX_ENTRY, size = 0) {
   const ds = new DecompressionStream('deflate-raw');
   const writer = ds.writable.getWriter();
   writer
@@ -211,24 +221,32 @@ export async function inflateRaw(data, max = MAX_ENTRY) {
     .catch(() => {});
   const reader = ds.readable.getReader();
   const chunks = [];
+  let out = size > 0 && size <= max ? new Uint8Array(size) : null;
   let total = 0;
   let truncated = false;
   try {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      total += value.length;
-      if (total > max) {
+      if (total + value.length > max) {
         reader.cancel().catch(() => {});
-        throw userError('This file unpacks to more data than can be read safely.', 'too-large');
+        throw tooLarge();
       }
-      chunks.push(value);
+      if (out && total + value.length <= out.length) out.set(value, total);
+      else {
+        // (more than the directory said: chunks from here on)
+        if (out) chunks.push(out.subarray(0, total));
+        out = null;
+        chunks.push(value);
+      }
+      total += value.length;
     }
   } catch (e) {
     if (e.user) throw e;
     truncated = true;
   }
-  return { data: concat(chunks, total), truncated };
+  // (a stream shorter than said: a copy, so the bigger buffer is not kept alive)
+  return { data: out ? (total === out.length ? out : out.slice(0, total)) : concat(chunks, total), truncated };
 }
 
 function decodeXmlBytes(b) {
@@ -244,6 +262,7 @@ class Zip {
     this.truncated = false;
     this.names = [...entries.keys()];
     this._lower = null;
+    this.inflated = 0; // bytes inflated so far, against MAX_TOTAL
   }
 
   // Exact name first, then percent-decoded, then case-insensitive (some writers differ in case).
@@ -275,7 +294,10 @@ class Zip {
     const e = this.entry(name);
     if (!e) return null;
     if (e.encrypted) throw userError('This file is password-protected. Remove the password and try again.', 'encrypted');
-    if (e.usize > max && e.usize !== 0xffffffff) throw userError('This file unpacks to more data than can be read safely.', 'too-large');
+    // what this entry may inflate to: its cap, what is left of the archive's, and no more than
+    // MAX_RATIO times its compressed size once past RATIO_FREE
+    const cap = Math.min(max, MAX_TOTAL - this.inflated, Math.max(RATIO_FREE, MAX_RATIO * e.csize));
+    if (e.usize > cap && e.usize !== 0xffffffff) throw tooLarge();
     const lh = await this._read(e.offset, e.offset + 30);
     if (lh.length < 30 || view(lh).getUint32(0, true) !== LOCAL) throw userError('This file looks damaged, so it can’t be opened.', 'corrupt');
     const start = e.offset + 30 + view(lh).getUint16(26, true) + view(lh).getUint16(28, true);
@@ -283,13 +305,15 @@ class Zip {
     if (raw.length < e.csize) this.truncated = true;
     if (e.method === 0) return raw;
     if (e.method !== 8) throw userError('This file uses a kind of compression the browser can’t unpack.', 'unsupported');
-    const out = await inflateRaw(raw, max);
+    const out = await inflateRaw(raw, cap, e.usize !== 0xffffffff ? e.usize : 0);
+    this.inflated += out.data.length;
     if (out.truncated) this.truncated = true;
     return out.data;
   }
 
+  // an XML or XHTML part, as text
   async text(name) {
-    const b = await this.bytes(name);
+    const b = await this.bytes(name, MAX_TEXT);
     return b == null ? null : decodeXmlBytes(b);
   }
 }

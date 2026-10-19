@@ -1,6 +1,9 @@
 // Pinned versions of everything readkit loads at runtime. Pinning keeps behaviour
 // stable and lets service workers cache by URL. configure() overrides any of these:
-// tests point them at local copies, and apps can self-host.
+// tests point them at local copies, and apps can self-host. tools/vendor.mjs copies the
+// files an app needs into it (a Chrome extension may load no remote code) and writes a module
+// that points these at the copies; a null URL marks a library as not there (its loader fails
+// instead of reaching the network). See docs/chrome-extension.md.
 
 const JSD = 'https://cdn.jsdelivr.net/npm/';
 const HF = 'https://huggingface.co/';
@@ -21,6 +24,15 @@ export const config = {
   piperPhonemize: JSD + '@diffusionstudio/piper-wasm@1.0.0/build/',
   defuddle: JSD + 'defuddle@0.19.5/dist/index.js',
   readability: JSD + '@mozilla/readability@0.6.0/Readability.js',
+  // Subresource Integrity for the classic scripts readkit adds to the page (Defuddle,
+  // Readability), by URL: the sha256 in tools/vendor-lock.json. A file changed on the CDN or on
+  // the way is refused, not run with the app's origin (and its tokens). pdf.js, Tesseract and
+  // the voice engines load as modules or inside workers, which this cannot cover: an app that
+  // keeps secrets should self-host them (tools/vendor.mjs checks each file's sha256).
+  integrity: {
+    [JSD + 'defuddle@0.19.5/dist/index.js']: 'sha256-kRH1GiunKJwFhtALBCNK9G+yPatdt607g3thXtjS+SI=',
+    [JSD + '@mozilla/readability@0.6.0/Readability.js']: 'sha256-NNyrPQgy0AGfApkO7WthJOAp6MMrnwxvJVBUT/jf8XQ=',
+  },
   kokoro: {
     // The timestamped export adds a durations output, which gives word timings.
     base: HF + 'onnx-community/Kokoro-82M-v1.0-ONNX-timestamped/resolve/dd4401a9add81ac692d20e240d22ec9dda82cc29/',

@@ -1,6 +1,9 @@
 // Local servers for the v2 browser test.
 //   appServer({ isolate }): Readout itself; isolate adds the COOP/COEP headers sw.js gives on
 //     GitHub Pages (so a test can skip the service worker), without it the server is like Pages.
+//     files: { '/url/path': file } served instead (looked up per request, so a test can put the
+//     next release in place); ctl.gate(req, path): a promise to wait for before answering (a
+//     slow or silent network), or null.
 //   modelServer(): a second origin standing in for Hugging Face and jsDelivr, with local copies
 //     of the voice models, onnxruntime-web, espeak and pdf.js / Tesseract. Range requests work
 //     (voice downloads resume). Paths follow readkit's tests/fixtures/voice/server.mjs, which is
@@ -95,9 +98,15 @@ function listen(server) {
 // are never copied).
 export function appServer({ isolate = false, files = {} } = {}) {
   const log = [];
+  const ctl = { gate: null };
   const server = http.createServer((req, res) => {
     const p = decodeURIComponent(new URL(req.url, 'http://x').pathname);
-    log.push({ method: req.method, path: p });
+    log.push({ method: req.method, path: p, at: Date.now() });
+    const gate = ctl.gate && ctl.gate(req, p);
+    if (gate) gate.then(() => answer(req, res, p));
+    else answer(req, res, p);
+  });
+  function answer(req, res, p) {
     const headers = isolate ? { 'Cross-Origin-Opener-Policy': 'same-origin', 'Cross-Origin-Embedder-Policy': 'credentialless', 'Cross-Origin-Resource-Policy': 'same-origin' } : {};
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       // like GitHub Pages: only the service worker can take the share sheet's POST
@@ -110,15 +119,22 @@ export function appServer({ isolate = false, files = {} } = {}) {
       return res.end();
     }
     sendFile(req, res, file, headers);
-  });
-  return listen(server).then((s) => Object.assign(s, { log }));
+  }
+  return listen(server).then((s) => Object.assign(s, { log, ctl }));
 }
 
+// ctl.gate as for appServer (a download held part way, say).
 export function modelServer() {
   const log = [];
+  const ctl = { gate: null };
   const server = http.createServer((req, res) => {
     const p = decodeURIComponent(new URL(req.url, 'http://x').pathname);
     log.push({ path: p, range: req.headers.range || null });
+    const gate = ctl.gate && ctl.gate(req, p);
+    if (gate) gate.then(() => answer(req, res, p));
+    else answer(req, res, p);
+  });
+  function answer(req, res, p) {
     const h = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Expose-Headers': 'Content-Range, Content-Length, Accept-Ranges', 'Cross-Origin-Resource-Policy': 'cross-origin' };
     if (req.method === 'OPTIONS') {
       res.writeHead(204, Object.assign(h, { 'Access-Control-Allow-Headers': 'Range', 'Access-Control-Allow-Methods': 'GET, HEAD' }));
@@ -140,8 +156,8 @@ export function modelServer() {
       return res.end();
     }
     sendFile(req, res, file, h);
-  });
-  return listen(server).then((s) => Object.assign(s, { log }));
+  }
+  return listen(server).then((s) => Object.assign(s, { log, ctl }));
 }
 
 // READOUT_CONFIG.readkit overrides for local pdf.js / Tesseract copies on the model server.

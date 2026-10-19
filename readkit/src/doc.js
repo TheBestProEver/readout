@@ -72,6 +72,7 @@ export function makeBlock(type, text, extra) {
     if (extra.page > 0) b.page = extra.page;
     if (typeof extra.conf === 'number') b.conf = extra.conf;
     if (extra.skip) b.skip = extra.skip;
+    if (extra.cell && t === 'cell') b.cell = { table: extra.cell.table, row: extra.cell.row, col: extra.cell.col };
   }
   return b;
 }

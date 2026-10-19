@@ -5,7 +5,7 @@ import { config } from '../config.js';
 import { voiceCatalog, voiceFiles, findVoice, defaultVoice, fallbackVoice, DEFAULT_VOICE } from './catalog.js';
 import { voiceStore } from './store.js';
 import { createSystemVoice, systemVoices } from './system.js';
-import { judge, cacheKey, readCache, writeCache, HF_REFERENCE } from './calibrate.js';
+import { judge, cacheKey, cachedRender, storeRender, HF_REFERENCE } from './calibrate.js';
 import { concat } from './pcm.js';
 import { moduleWorker } from '../worker.js';
 
@@ -155,19 +155,22 @@ export async function createVoice(opts = {}) {
 
     // { ok, rt, device, reason, message, cached, stats }; rt is audio seconds per compute
     // second at speed 1. opts: { speed (the listening speed to judge for), force, signal }.
+    // Only a render that passes at speed 1 is reused; after a failing one, the next call
+    // measures again, so an app's 'check again' can succeed.
     async calibrate(o = {}) {
       const speed = +o.speed || 1;
       const key = cacheKey(entry.engine, info.deviceKey);
       const test = o._corrupt || null;
-      let stats = !o.force && !test ? readCache(key) : null;
+      // The spectrum reference belongs to the voice that rendered the cached sentence.
+      const hfRefOf = (s) => (entry.engine === 'kokoro' && HF_REFERENCE[s.voice] != null ? HF_REFERENCE[s.voice] : null);
+      let stats = !o.force && !test ? cachedRender(key, hfRefOf) : null;
       const cached = !!stats;
       if (!stats) {
         const m = await request({ type: 'calibrate', corrupt: test }, { signal: o.signal });
         stats = { ...m.stats, voice: id, device: info.device, at: Date.now() };
-        if (!test) writeCache(key, stats);
+        if (!test) storeRender(key, stats, hfRefOf(stats));
       }
-      // The spectrum reference belongs to the voice that rendered the cached sentence.
-      const hfRef = entry.engine === 'kokoro' && HF_REFERENCE[stats.voice] != null ? HF_REFERENCE[stats.voice] : null;
+      const hfRef = hfRefOf(stats);
       const v = judge(stats, { speed, hfRef });
       return { ok: v.ok, rt: v.rt, device: info.device, reason: v.reason, message: v.message, cached, stats };
     },

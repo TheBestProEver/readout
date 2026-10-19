@@ -2,8 +2,9 @@
 // synthesized twice (the first run warms up kernels for that length; each WebGPU call also
 // has about 1 s of fixed cost, so a short sentence would understate the speed), and the
 // second render is checked: speed, NaN, level, and for Kokoro the >6 kHz share that
-// onnxruntime #29807's WebGPU corruption shifts. Results are cached per engine, device and
-// Chrome major version, since a driver or browser update can change both speed and output.
+// onnxruntime #29807's WebGPU corruption shifts. Passing results are cached per engine, device
+// and Chrome major version, since a driver or browser update can change both speed and output;
+// a failing one is not, so the next calibrate() measures again (a busy GPU, a transient NaN).
 import { levels, highBandShare } from './pcm.js';
 
 export const CALIBRATION = Object.freeze({
@@ -112,4 +113,31 @@ export function writeCache(key, value) {
   } catch (e) {
     /* private mode or quota: calibration just reruns next time */
   }
+}
+
+export function clearCache(key) {
+  try {
+    localStorage.removeItem(key);
+  } catch (e) {
+    /* nothing stored */
+  }
+}
+
+// Is a render worth reusing? Only one that passes at speed 1. A render that failed (measured
+// while the GPU was busy or throttled, or with a transient NaN) would otherwise come back on
+// every retry until the next Chrome version, and the voice would stay refused.
+export function reusable(stats, hfRef = null) {
+  return !!stats && judge(stats, { speed: 1, hfRef }).ok;
+}
+
+// The cached render for key if it is reusable; hfRefOf(stats) gives its spectrum reference.
+export function cachedRender(key, hfRefOf = () => null) {
+  const s = readCache(key);
+  return s && reusable(s, hfRefOf(s)) ? s : null;
+}
+
+// Keep a fresh render for next time, or forget the stored one when this render failed.
+export function storeRender(key, stats, hfRef = null) {
+  if (reusable(stats, hfRef)) writeCache(key, stats);
+  else clearCache(key);
 }

@@ -39,15 +39,23 @@ const CAP_WORD = /^["'“‘(]?\p{Lu}/u;
 const NAME = /^\p{Lu}[\p{L}'’-]*,?$/u;
 const ORDINAL = /^\d+(?:st|nd|rd|th|[A-Z])$/;
 
-function nextToken(s, end) {
-  NEXT.lastIndex = end;
-  const m = NEXT.exec(s);
-  return m ? m[2] : '';
+// A word the user's lexicon respelled is held as one private-use character until the end;
+// the rules here see the word it stands for ('Dr. Patel' with Patel -> 'Puh-tell').
+const HELD = /[-]/gu;
+function seen(tok, ctx) {
+  if (!tok || !ctx || !ctx.savedFrom || !ctx.savedFrom.length) return tok;
+  return tok.replace(HELD, (c) => ctx.savedFrom[c.charCodeAt(0) - 0xe000] ?? c);
 }
 
-function prevToken(s, i) {
+function nextToken(s, end, ctx) {
+  NEXT.lastIndex = end;
+  const m = NEXT.exec(s);
+  return m ? seen(m[2], ctx) : '';
+}
+
+function prevToken(s, i, ctx) {
   const m = /(\S+)\s+$/.exec(s.slice(Math.max(0, i - 40), i));
-  return m ? m[1] : '';
+  return m ? seen(m[1], ctx) : '';
 }
 
 // A capitalized word that isn't just a sentence opener ('Patel', not 'The').
@@ -83,8 +91,8 @@ function expandAbbr(m, s, ctx) {
     // 'No' only with a capital: 'no 5-year-old' isn't 'number'
     if (!(key === 'no' && !dot)) return [[num, 0, len], ...(glued ? [' '] : [])];
   }
-  const next = nextToken(s, end);
-  const prev = prevToken(s, i);
+  const next = nextToken(s, end, ctx);
+  const prev = prevToken(s, i, ctx);
   const prevName = NAME.test(prev) || ORDINAL.test(prev);
   // Martin Luther King Jr., John Patel Sr.
   // ('Sr. Mary' before a name is a nun, so Sr/Snr need no name after them)
@@ -144,7 +152,7 @@ export function abbrRules(t, ctx) {
   // book sizes: '4to', '8vo', '12mo'
   if (/\d(?:to|vo|mo)\b/.test(t.s)) t.replace(/(?<![\p{L}\p{N}])(4to|8vo|12mo|16mo|24mo|32mo)(?![\p{L}\p{N}])/gu, (m) => FORMATS[m[1]]);
   // Roe v. Wade, Brown v Board
-  t.replace(/(?<=\s)v\.?(?=\s+\p{Lu})/gu, (m, s) => (NAME.test(prevToken(s, m.index)) ? 'versus' : null));
+  t.replace(/(?<=\s)v\.?(?=\s+\p{Lu})/gu, (m, s) => (NAME.test(prevToken(s, m.index, ctx)) ? 'versus' : null));
   // statutes: '22 Charles II. c. 13', '30 Geo. III. c. 4', '5 Anne, c. 6' -> 'chapter'
   if (/[IVXe][.,]?\s?c\.\s?\d/.test(t.s)) {
     t.replace(/(?<![\p{L}\p{N}.])c\.\s?(?=\d{1,3}(?!\d))/gu, (m, s) => (STATUTE_BEFORE.test(s.slice(Math.max(0, m.index - 16), m.index)) ? 'chapter ' : null));

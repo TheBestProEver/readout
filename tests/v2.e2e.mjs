@@ -25,6 +25,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { PAGE_HELPERS, checker, connect, launchChrome, newDevice, sleep } from './browser.mjs';
 import { appServer, modelServer, assetConfig, have } from './fixtures/servers.mjs';
+import { ROOT, fingerprint, kitManifest } from '../tools/readkit-files.mjs';
 import { fakeGitHub } from './fixtures/github.mjs';
 import { all as otherFiles } from './fixtures/docs.mjs';
 
@@ -362,6 +363,29 @@ async function main() {
         await waitFor(`T.R().au.player && T.R().au.player.state === 'playing'`, 30000, 'playing again');
         check((await ev(`return T.R().au.player.index`)) === place.idx, 'after a reload, play goes on from the same sentence');
 
+        console.log('At the end of a text: one tap plays it again');
+        await ev(`T.$('playBtn').click(); T.R().state.settings.autoNext = false; return 1`);
+        const endId = await ev(`const id = T.newNote('The kettle sang on the stove. The tea was ready at last.'); T.done(); return id;`);
+        await waitFor(`T.R().au.voice && T.R().au.voice.id === 'en_US-ryan-medium' && !T.R().au.loading && !T.R().tts.playing`, 60000, 'the voice');
+        const toEnd = async () => {
+          await waitFor(`!T.R().tts.playing && T.R().au.player && T.R().au.player.state === 'ended' && T.$('playBtn').getAttribute('aria-label') === 'Play again from the start'`, 60000, 'the end of the text');
+          await sleep(300);
+        };
+        await phone.click('#playBtn');
+        await waitFor(`T.R().tts.playing && T.R().au.player && T.R().au.player.state === 'playing'`, 30000, 'playing');
+        await toEnd();
+        await phone.click('#playBtn');
+        const again = await ev(`await new Promise((r) => setTimeout(r, 300)); const at300 = { playing: T.R().tts.playing, label: T.$('playBtn').getAttribute('aria-label') }; await T.wait(() => T.R().au.player && T.R().au.player.state === 'playing', 15000).catch(() => {}); const p = T.R().au.player; return { at300, playing: T.R().tts.playing, player: p && p.state, idx: T.R().state.idx, doc: T.cur().id }`);
+        check(again.at300.playing && again.playing && again.player === 'playing' && again.idx === 0 && again.doc === endId, 'after the end, one tap on Play reads the text again from the start', again);
+        await toEnd();
+        await ev(`document.querySelector('#reader .chunk[data-i="1"]').click(); return 1`);
+        const tapped = await ev(`await T.wait(() => T.R().au.player && T.R().au.player.state === 'playing', 15000).catch(() => {}); const p = T.R().au.player; return { playing: T.R().tts.playing, player: p && p.state, idx: T.R().state.idx, at: p && p.index }`);
+        check(tapped.playing && tapped.player === 'playing' && tapped.idx === 1, 'and so does one tap on a sentence, from there', tapped);
+        await ev(`T.R().tts.playing && T.$('playBtn').click(); return 1`);
+        await ev(`T.open(${JSON.stringify(longId)}); return 1`);
+        await phone.click('#playBtn');
+        await waitFor(`T.R().au.player && T.R().au.player.state === 'playing' && T.cur().id === ${JSON.stringify(longId)}`, 30000, 'the long text playing again');
+
         console.log('When the voice fails: the device voice takes over');
         // (as when a phone's graphics driver or the voice's worker gives out)
         await ev(`T.R().au.voice.synth = () => Promise.reject(Object.assign(new Error('the voice worker crashed'), { code: 'worker-crashed' })); T.R().seekTo(Math.min(T.R().state.segs.length - 30, T.R().state.idx + 40)); return 1`);
@@ -450,6 +474,20 @@ async function main() {
         await ev(`localStorage.removeItem('readout-natural-check'); T.closeSheets(); return 1`);
         }
 
+        console.log('Check again measures Michael again, not the stored result of the last check');
+        // readkit keeps a passing check per device and Chrome version: plant one no real render
+        // gives (99x real time), and Readout's record of a failed check (as after a hot phone)
+        const calKey = await ev(`const k = Object.keys(localStorage).find((x) => x.startsWith('readkit.calibration.v1|kokoro|')); if (!k) return null; const s = JSON.parse(localStorage.getItem(k)); localStorage.setItem(k, JSON.stringify(Object.assign(s, { rt: 99, planted: true }))); localStorage.setItem('readout-natural-check', JSON.stringify({ chrome: (/Chrome\\/(\\d+)/.exec(navigator.userAgent) || [])[1], ok: false, reason: 'slow', rt: 0.4 })); return k`);
+        check(!!calKey, 'readkit kept the result of Michael’s check', calKey);
+        if (calKey) {
+          await ev(`T.R().tts.playing && T.$('playBtn').click(); __toasts.length = 0; T.closeSheets(); T.$('speedBtn').click(); return 1`);
+          await waitFor(`!T.$('voiceRetryBtn').hidden`, 5000, 'Check again');
+          await phone.click('#voiceRetryBtn');
+          await waitFor(`__toasts.some((t) => /Michael works on this device|Michael doesn’t run well/.test(t))`, 180000, 'the check');
+          const ca = await ev(`return { toasts: __toasts.slice(-3), rec: JSON.parse(localStorage.getItem('readout-natural-check')), kept: JSON.parse(localStorage.getItem(${JSON.stringify(calKey)})), e: T.R().chooseEngine() }`);
+          check(ca.toasts.some((t) => /Michael works on this device/.test(t)) && ca.rec && ca.rec.ok && ca.rec.rt > 0 && ca.rec.rt < 50 && ca.kept && !ca.kept.planted && ca.e.id === 'am_michael', `Check again renders the check sentence again (${ca.rec && ca.rec.rt ? ca.rec.rt.toFixed(1) : '?'}× real time), and Michael reads again`, ca);
+          await ev(`T.closeSheets(); return 1`);
+        }
       }
     }
 
@@ -560,7 +598,10 @@ async function main() {
 
 async function swSection(cdp, devices, models) {
   console.log('Service worker on a host without headers (like GitHub Pages)');
-  const host = await appServer({ isolate: false });
+  // (release: files of a next release, put in place part way through)
+  const release = {};
+  const host = await appServer({ isolate: false, files: release });
+  const kitList = kitManifest();
   const gh = fakeGitHub();
   await new Promise((r) => gh.server.listen(0, '127.0.0.1', r));
   gh.base = `http://127.0.0.1:${gh.server.address().port}`;
@@ -596,8 +637,49 @@ async function swSection(cdp, devices, models) {
     check(ok, 'the first visit reloads once and is then cross-origin isolated');
     const h = await ev(`const a = await fetch('readkit/index.js'); const b = await fetch('./'); return { kit: [a.headers.get('cross-origin-opener-policy'), a.headers.get('cross-origin-embedder-policy')], page: [b.headers.get('cross-origin-opener-policy'), b.headers.get('cross-origin-embedder-policy')], reload: sessionStorage.getItem('readout-coi-reload') }`);
     check(h.kit.join() === 'same-origin,credentialless' && h.page.join() === 'same-origin,credentialless', 'the service worker adds COOP same-origin and COEP credentialless', h);
-    await waitFor(`(async () => { const ks = await caches.keys(); const k = ks.find((x) => x.startsWith('readout-kit-')); return k && (await (await caches.open(k)).keys()).length >= 109; })()`, 90000, 'readkit cached');
-    check(true, 'readkit’s runtime files are kept for offline use');
+    await waitFor(`(async () => { const ks = await caches.keys(); const k = ks.find((x) => x.startsWith('readout-kit-')); return k && (await (await caches.open(k)).keys()).length >= ${kitList.files.length}; })()`, 90000, 'readkit cached');
+    const kc = await ev(`const ks = (await caches.keys()).filter((x) => x.startsWith('readout-kit-')); const c = await caches.open(ks[0]); const urls = (await c.keys()).map((r) => new URL(r.url).pathname.slice(1)); return { caches: ks, urls }`);
+    check(kc.caches.length === 1 && kc.caches[0] === 'readout-kit-' + kitList.kitVersion && kc.urls.length === kitList.files.length && kitList.files.every(([f]) => kc.urls.includes(f)), `readkit’s runtime files are kept for offline use (all ${kitList.files.length}, the entry points voice.js and player.js too, checked against their fingerprints)`, { caches: kc.caches, n: kc.urls.length });
+    const kv = await ev(`return { from: T.R().kit.from, sw: await new Promise((r) => { const ch = new MessageChannel(); ch.port1.onmessage = (e) => r(e.data); navigator.serviceWorker.controller.postMessage({ type: 'kit-version' }, [ch.port2]); setTimeout(() => r(null), 3000); }) }`);
+    check(kv.sw && kv.sw.kit === kitList.kitVersion && kv.from === kitList.kitVersion, 'the service worker says which readkit it keeps, the one this app.js is for', kv);
+
+    if (have.ryan) {
+      console.log('The reload to cross-origin isolation waits for a voice download');
+      // A first visit where the worker is still keeping readkit when a download starts: the
+      // download is held part way (as a 63 MB one on a phone would be) while the worker takes over.
+      let letGo;
+      const held = new Promise((r) => (letGo = r));
+      host.ctl.gate = (req, p) => (p === '/readkit/data/g2p/lex-us.txt' ? sleep(12000) : null);
+      models.ctl.gate = (req, p) => (/en_US-ryan-medium\.onnx$/.test(p) ? held : null);
+      const fv = await newDevice(cdp, 'first-visit phone', { phone: true, touch: false, config: { swOnLocalhost: true, readkit: { piper: models.base + '/piper/' } }, init: PROBE });
+      try {
+        await fv.goto(host.base + '/');
+        await fv.eval(`window.__firstPage = true; T.R().state.settings.voiceMode = 'standard'; T.$('speedBtn').click(); await T.wait(() => !T.$('voiceGetBtn').hidden, 15000, 'Download'); return 1`);
+        await fv.click('#voiceGetBtn');
+        await fv.eval(`await T.wait(() => T.$('voiceSheet').open, 10000, 'the question'); return 1`);
+        await fv.click('#voiceSheetYes');
+        const started = await fv.eval(`await T.wait(() => T.R().au.dl, 10000, 'the download'); T.closeSheets(); return { ctl: !!navigator.serviceWorker.controller, dl: !!T.R().au.dl }`);
+        check(started.dl && !started.ctl, 'a download starts before the service worker has taken over', started);
+        let st = null;
+        const t0 = Date.now();
+        while (Date.now() - t0 < 60000) {
+          st = await fv.eval(`return { first: !!window.__firstPage, ctl: !!navigator.serviceWorker.controller, dl: !!(window.__readout && window.__readout.au.dl), reload: sessionStorage.getItem('readout-coi-reload') }`).catch(() => null);
+          if (!st || !st.first || st.ctl) break;
+          await sleep(250);
+        }
+        await sleep(6000); // (the reload would come within 4 s of the worker taking over)
+        st = await fv.eval(`return { first: !!window.__firstPage, ctl: !!navigator.serviceWorker.controller, dl: !!(window.__readout && window.__readout.au.dl), reload: sessionStorage.getItem('readout-coi-reload') }`).catch((e) => ({ error: e.message }));
+        check(st.first && st.ctl && st.dl && !st.reload, 'once the worker is in charge, the page doesn’t reload under the download', st);
+        letGo();
+        const done = await fv.eval(`await T.wait(() => T.R().au.installed.has('en_US-ryan-medium'), 120000, 'the download to finish').catch(() => {}); return { installed: T.R().au.installed.has('en_US-ryan-medium'), first: !!window.__firstPage }`).catch((e) => ({ error: e.message }));
+        check(done.installed && done.first, 'and the download finishes', done);
+      } finally {
+        letGo();
+        host.ctl.gate = null;
+        models.ctl.gate = null;
+        await cdp.send('Target.closeTarget', { targetId: fv.targetId }).catch(() => {});
+      }
+    }
 
     const online = await ev(`try { await fetch('https://fonts.googleapis.com/css2?family=Literata', { mode: 'no-cors' }); return true; } catch (e) { return false; }`);
     if (!online) console.log('  (no internet: the jsDelivr and Google Fonts checks are skipped)');
@@ -680,6 +762,87 @@ async function swSection(cdp, devices, models) {
     // a file of the app opened as a page (an iframe navigation) is not kept as the offline app
     const kept = await ev(`const f = document.createElement('iframe'); f.src = 'manifest.webmanifest'; document.body.append(f); await new Promise((r) => { f.onload = r; setTimeout(r, 5000); }); f.remove(); await new Promise((r) => setTimeout(r, 300)); const k = (await caches.keys()).find((x) => x.startsWith('readout-shell-')); const r = k && (await (await caches.open(k)).match('./')); return r ? r.headers.get('Content-Type') : null`);
     check(/text\/html/.test(kept || ''), 'the offline copy of the app page stays the app page', kept);
+
+    console.log('The next release, with a new readkit: its first start already runs on it');
+    // (as when readkit is copied in again: KIT_VERSION, app.js?v= and one readkit file change)
+    const NEXT = kitList.kitVersion + '-next';
+    const nextDir = fs.mkdtempSync(path.join(os.tmpdir(), 'readout-next-'));
+    try {
+      const read = (f) => fs.readFileSync(path.join(ROOT, f), 'utf8');
+      const put = (name, text) => {
+        const f = path.join(nextDir, name);
+        fs.writeFileSync(f, text);
+        return f;
+      };
+      const cfg = read('readkit/src/config.js') + '\nexport const __nextRelease = true;\n';
+      const cfgPrint = fingerprint(Buffer.from(cfg));
+      const oldPrint = kitList.files.find(([f]) => f === 'readkit/src/config.js')[1];
+      const appV = /app\.js\?v=(\w+)/.exec(read('index.html'))[1];
+      const swNext = read('sw.js')
+        .replace(/const VERSION = '([^']*)';/, "const VERSION = '$1-next';")
+        .replace(`const KIT_VERSION = '${kitList.kitVersion}';`, `const KIT_VERSION = '${NEXT}';`)
+        .replace(`["readkit/src/config.js","${oldPrint}"]`, `["readkit/src/config.js","${cfgPrint}"]`)
+        .replace(`'app.js?v=${appV}'`, `'app.js?v=next'`);
+      const appNext = read('app.js').replace(`const KIT_VERSION = '${kitList.kitVersion}';`, `const KIT_VERSION = '${NEXT}';`);
+      const htmlNext = read('index.html').replace(`app.js?v=${appV}`, 'app.js?v=next');
+      if (!swNext.includes(NEXT) || !swNext.includes(cfgPrint) || !swNext.includes(`'app.js?v=next'`) || !appNext.includes(NEXT) || !htmlNext.includes('app.js?v=next')) throw new Error('the next release could not be made');
+      // a second tab, open since before the release
+      const oldTab = await newDevice(cdp, 'old tab', { phone: true, touch: false, context: dev.context, config: { swOnLocalhost: true, githubApi: gh.base, netWait: 8000 }, init: PROBE });
+      await oldTab.goto(host.base + '/');
+      const o0 = await oldTab.eval(`await T.wait(() => T.R().kit.K, 15000); return { from: T.R().kit.from, ctl: !!navigator.serviceWorker.controller }`);
+      check(o0.from === kitList.kitVersion && o0.ctl, 'a second tab runs the current release', o0);
+      const html = put('index.html', htmlNext);
+      Object.assign(release, { '/sw.js': put('sw.js', swNext), '/app.js': put('app.js', appNext), '/': html, '/index.html': html, '/readkit/src/config.js': put('config.js', cfg) });
+      const mark = host.log.length;
+      const t0 = Date.now();
+      await dev.goto(host.base + '/');
+      await settle(60000);
+      await waitFor(`T.R().kit.K && T.R().kit.from === ${JSON.stringify(NEXT)}`, 60000, 'readkit of the next release');
+      const took = Date.now() - t0;
+      // (the new worker deletes the old copy as it takes over: the page may already be on it)
+      await waitFor(`(async () => (await caches.keys()).filter((k) => k.startsWith('readout-kit-')).length === 1)()`, 15000, 'the old readkit copy to go').catch(() => {});
+      const nx = await ev(`const c = await import('./readkit/src/config.js'); const ks = await caches.keys(); return { from: T.R().kit.from, stale: T.R().kit.stale, marker: c.__nextRelease === true, kits: ks.filter((k) => k.startsWith('readout-kit-')), app: [...document.scripts].map((s) => s.src).find((s) => /app\.js/.test(s)), spans: document.querySelectorAll('#reader .chunk').length }`);
+      const fetched = host.log.slice(mark).filter((e) => e.path.startsWith('/readkit/')).map((e) => e.path);
+      check(nx.from === NEXT && nx.marker && !nx.stale && /v=next/.test(nx.app || '') && nx.spans > 0, `the first start of the new app.js waits for the new worker (${(took / 1000).toFixed(1)} s), then loads the new readkit, not the old worker’s copy`, nx);
+      check(nx.kits.length === 1 && nx.kits[0] === 'readout-kit-' + NEXT, 'the old readkit copy is gone', nx.kits);
+      check(fetched.length >= 1 && fetched.every((p) => p === '/readkit/src/config.js'), `the new worker downloads only the changed readkit file (${fetched.length} request), the rest comes from the old copy`, fetched);
+      // the tab from before: told (it's visible here), or reloaded at once when hidden
+      const o1 = await oldTab.eval(`await T.wait(() => T.R().kit.stale, 20000).catch(() => {}); return { stale: T.R().kit.stale, toast: T.toast() }`).catch((e) => ({ error: e.message }));
+      if (o1.stale) {
+        check(/Readout was updated/.test(o1.toast), 'the tab still on the old release is asked to reload', o1);
+        await oldTab.eval(`T.$('toastAction').click(); return 1`).catch(() => {});
+      }
+      let o2 = null;
+      for (let i = 0; i < 120 && !(o2 && o2.from); i++) {
+        await sleep(250);
+        o2 = await oldTab.eval(`const R = window.__readout; return R && document.readyState === 'complete' && R.kit.K ? { from: R.kit.from, stale: R.kit.stale } : null`).catch(() => null);
+      }
+      check(o2 && o2.from === NEXT && !o2.stale, 'and once reloaded it runs the new release', { o1, o2 });
+      await cdp.send('Target.closeTarget', { targetId: oldTab.targetId }).catch(() => {});
+    } finally {
+      fs.rmSync(nextDir, { recursive: true, force: true });
+    }
+    await ev(`T.closeSheets(); return 1`);
+
+    console.log('A connection that is up but carries nothing (one bar of signal)');
+    await ev(`window.__before = true; return 1`);
+    let unhang;
+    const hung = new Promise((r) => (unhang = r));
+    host.ctl.gate = () => hung; // every request is taken and not answered
+    const lt0 = Date.now();
+    dev.send('Page.navigate', { url: host.base + '/' }).catch(() => {});
+    let lf = null;
+    while (Date.now() - lt0 < 30000) {
+      // (each look bounded: a page stuck in its navigation may not answer at all)
+      lf = await Promise.race([ev(`const R = window.__readout; return !window.__before && R && document.readyState === 'complete' ? { kit: !!R.kit.K, spans: document.querySelectorAll('#reader .chunk').length, segs: R.state.segs.length } : null`).catch(() => null), sleep(2000).then(() => null)]);
+      if (lf) break;
+      await sleep(200);
+    }
+    const lfTook = Date.now() - lt0;
+    check(lf && lf.kit && lf.spans > 0 && lfTook < 12000, `Readout opens from its kept copy within seconds (${(lfTook / 1000).toFixed(1)} s) instead of waiting on the network`, { lf, lfTook });
+    host.ctl.gate = null;
+    unhang();
+    await settle(15000);
 
     console.log('Offline');
     await host.close();

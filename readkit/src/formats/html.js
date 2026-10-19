@@ -12,7 +12,8 @@ import { readMime } from './mime.js';
 
 const loading = new Map();
 
-// Loads a classic script that defines a global (UMD builds, Readability.js) and returns it.
+// Loads a classic script that defines a global (UMD builds, Readability.js) and returns it,
+// checked against config.integrity[url] when the URL is pinned there.
 export function loadGlobal(url, name, timeout = 20000) {
   if (globalThis[name]) return Promise.resolve(globalThis[name]);
   if (!url || typeof document === 'undefined') return Promise.reject(new Error('cannot load ' + name + ' here'));
@@ -23,6 +24,12 @@ export function loadGlobal(url, name, timeout = 20000) {
         s.remove();
         reject(new Error('timed out loading ' + url));
       }, timeout);
+      // (pinned files carry their hash: config.integrity)
+      const sri = config.integrity && config.integrity[url];
+      if (sri) {
+        s.integrity = sri;
+        s.crossOrigin = 'anonymous';
+      }
       s.src = url;
       s.async = true;
       s.onload = () => {
@@ -161,7 +168,7 @@ function liftBreaks(doc) {
 
 export async function readHtml(html, ctx) {
   const c = ctx || {};
-  if (typeof DOMParser === 'undefined') return stripHtml(html, c.url);
+  if (typeof DOMParser === 'undefined') return c.layout ? { ...stripHtml(html, c.url), layoutHtml: html } : stripHtml(html, c.url);
   const pause = c.pause || (async () => {});
   // Each parse and each extractor is one long, unsplittable task, so give the page back between them.
   const parse = () => {
@@ -172,6 +179,9 @@ export async function readHtml(html, ctx) {
     return d;
   };
   let doc = parse();
+  // for a calendar layout: the page's dates and addresses the article left out (a sidebar's
+  // <time> and <address>), read before the extractors change the page
+  const furniture = c.layout ? await datedFurniture(parse(), c) : [];
   const meta = pageMeta(doc);
   if (!doc.body) return { title: meta.title, blocks: [], warnings: [], how: 'none' };
   const docLike = documentLike(doc, meta);
@@ -197,7 +207,7 @@ export async function readHtml(html, ctx) {
       await pause();
       const res = new Defuddle(fresh(), { url: c.url || undefined }).parse();
       await pause();
-      if (res && res.content) candidates.push({ how: 'defuddle', title: res.title, blocks: await contentBlocks(res.content, c) });
+      if (res && res.content) candidates.push({ how: 'defuddle', title: res.title, blocks: await contentBlocks(res.content, c), meta: !!(res.published || res.author) });
     } catch (e) {
       if (e && e.name === 'AbortError') throw e;
       /* offline, blocked or failed: try the next one */
@@ -220,6 +230,10 @@ export async function readHtml(html, ctx) {
       blocks = best.blocks;
       title = best.title || title;
       how = best.how;
+      if (best.how === 'defuddle' && best.meta) {
+        await pause();
+        blocks = await restoreDated(blocks, parse(), title, c);
+      }
     }
     if (!blocks && used) doc = parse();
   }
@@ -231,7 +245,57 @@ export async function readHtml(html, ctx) {
     if (at > 0 && at < 4) blocks.splice(at, 1);
     blocks.unshift(makeBlock('h1', title));
   }
-  return { title, blocks, warnings: [], how };
+  const out = { title, blocks, warnings: [], how };
+  if (c.layout) {
+    const have = norm(blocks.map((b) => b.text).join(' '));
+    const extra = furniture.filter((b) => norm(b.text) && !have.includes(norm(b.text)));
+    out.layoutBlocks = extra.length ? [...blocks, ...extra] : blocks;
+    out.layoutHtml = html; // for schema.org events (src/calendar/schema.js)
+  }
+  return out;
+}
+
+// Defuddle takes the first short paragraph with a date among the three after the headline for
+// a byline and drops it whenever it found the page's date or author (its removeMetadataBlock,
+// which no option turns off), even 'Join us on Wednesday, November 4, 2026 at 6:00 pm at the
+// Seminary Co-op ...'. Such a paragraph that reads as a sentence (8 words or more, ending in
+// . ! or ?, not 'By ...' or 'Posted ...') and is missing from the article goes back after the
+// headline. d: a fresh parse of the page.
+const BYLINE = /^(?:by|posted|published|updated|last\s+updated|written|filed|photo(?:graph)?|image|credit)\b/i;
+async function restoreDated(blocks, d, title, c) {
+  // the headline: an h1 that the title starts with or the article has as a heading
+  const isHead = (h) => !!h && (norm(title).startsWith(h) || blocks.some((b) => /^h[1-3]$/.test(b.type) && norm(b.text) === h));
+  const h1 = d.body ? [...d.body.querySelectorAll('h1')].find((x) => isHead(norm(x.textContent))) : null;
+  if (!h1) return blocks;
+  const have = norm(blocks.map((b) => b.text).join(' '));
+  const back = [];
+  let el = h1.nextElementSibling;
+  for (let k = 0; el && k < 3; k++, el = el.nextElementSibling) {
+    if (el.localName !== 'p') continue;
+    const t = el.textContent.replace(/\s+/g, ' ').trim();
+    if (t.length >= 300 || countWords(t) < 8 || !/[.!?]["”’)]?$/.test(t) || BYLINE.test(t) || have.includes(norm(t))) continue;
+    back.push(...(await domToBlocks(el.cloneNode(true), { mode: 'content', pause: c.pause, source: 'markup' })));
+  }
+  if (!back.length) return blocks;
+  const at = blocks[0] && blocks[0].type === 'h1' ? 1 : 0;
+  return [...blocks.slice(0, at), ...back, ...blocks.slice(at)];
+}
+
+// <time> and <address> elements with the block around them (an aside, a list item, a card),
+// as blocks: what an event page says about when and where, wherever it sits.
+async function datedFurniture(d, c) {
+  if (!d.body) return [];
+  const seen = new Set();
+  const out = [];
+  for (const el of d.body.querySelectorAll('time, address')) {
+    let box = el;
+    while (box.parentNode && box.parentNode !== d.body && !/^(?:aside|section|article|li|header|footer|dl|div|main)$/.test(box.localName)) box = box.parentNode;
+    if (seen.has(box)) continue;
+    seen.add(box);
+    if ((box.textContent || '').length > 1500) continue;
+    out.push(...(await domToBlocks(box.cloneNode(true), { mode: 'content', pause: c.pause, source: 'markup' })));
+  }
+  return out;
 }
 
 // Saved pages (.mhtml) and e-mails (.eml).

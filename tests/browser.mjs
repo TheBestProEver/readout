@@ -190,8 +190,18 @@ export async function newDevice(cdp, name, opts) {
   const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
   const s = (m, p) => cdp.send(m, p, sessionId);
   const logs = [];
+  // A page that crashes or goes away fails what waits on it, instead of hanging the test.
+  let lost;
+  const gone = new Promise((_, reject) => (lost = reject));
+  gone.catch(() => {});
   cdp.listeners.add((msg) => {
+    if (msg.method === 'Target.detachedFromTarget' && msg.params.sessionId === sessionId) lost(new Error(`${name}: the page is gone`));
     if (msg.sessionId !== sessionId) return;
+    if (msg.method === 'Inspector.targetCrashed') {
+      logs.push({ type: 'exception', text: 'the page crashed' });
+      console.log(`  (${name}: the page crashed)`);
+      lost(new Error(`${name}: the page crashed`));
+    }
     if (msg.method === 'Runtime.consoleAPICalled') logs.push({ type: msg.params.type, text: msg.params.args.map((a) => (a.value !== undefined ? String(a.value) : a.description)).join(' ') });
     if (msg.method === 'Runtime.exceptionThrown') {
       const d = msg.params.exceptionDetails;
@@ -200,6 +210,7 @@ export async function newDevice(cdp, name, opts) {
   });
   await s('Page.enable');
   await s('Runtime.enable');
+  await s('Inspector.enable');
   await s('Emulation.setFocusEmulationEnabled', { enabled: true });
   await s('Page.addScriptToEvaluateOnNewDocument', { source: `window.READOUT_CONFIG = ${JSON.stringify(opts.config || {})};` });
   if (opts.init) await s('Page.addScriptToEvaluateOnNewDocument', { source: opts.init });
@@ -245,7 +256,7 @@ export async function newDevice(cdp, name, opts) {
       };
     },
     async eval(expr) {
-      const r = await s('Runtime.evaluate', { expression: `(async () => { ${expr} })()`, awaitPromise: true, returnByValue: true });
+      const r = await Promise.race([s('Runtime.evaluate', { expression: `(async () => { ${expr} })()`, awaitPromise: true, returnByValue: true }), gone]);
       if (r.exceptionDetails) throw new Error(`${name}: ` + ((r.exceptionDetails.exception && r.exceptionDetails.exception.description) || r.exceptionDetails.text));
       return r.result.value;
     },

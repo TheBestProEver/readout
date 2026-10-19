@@ -133,7 +133,10 @@ export function createPlayer(o = {}) {
   let encIn = 0;
   let live = null; // packets array of the open part, filled by the encoder's output callback
   let open = null; // open part: { index, offset, packets, appended, entry }
-  let seg = null; // segment being encoded: { index, samples, sr, speed, packets, words, drop }
+  let seg = null; // segment being encoded: { index, samples, sr, speed, voice, packets, words, drop }
+  // setVoice() while a segment is being heard: { ctl, index }; the old voice's batch is
+  // stopped once that segment is complete, so the rest of the sentence is not lost.
+  let abortAfter = null;
 
   const ctUs = () => Math.round(audio.currentTime * 1e6);
   const alive = (ep) => !destroyed && !fatal && ep === epoch;
@@ -150,23 +153,31 @@ export function createPlayer(o = {}) {
       store = null;
     }
   }
-  let revisionP = null;
-  const revision = () =>
-    (revisionP =
-      revisionP ||
-      (voice.revision
-        ? Promise.resolve(voice.revision)
-        : import('../voice/catalog.js').then(
-            (m) => {
-              const e = m.findVoice && m.findVoice(voice.id);
-              return (e && e.revision) || '';
-            },
-            () => '',
-          )));
-  const keys = new Map();
-  const keyOf = async (i, speed) => {
+  // Keys belong to the voice that rendered the clip: a segment the old voice still finishes
+  // after setVoice() is stored under the old voice's key, not the new one's.
+  const revisions = new WeakMap();
+  const revision = (v) => {
+    if (!revisions.has(v))
+      revisions.set(
+        v,
+        v.revision
+          ? Promise.resolve(v.revision)
+          : import('../voice/catalog.js').then(
+              (m) => {
+                const e = m.findVoice && m.findVoice(v.id);
+                return (e && e.revision) || '';
+              },
+              () => '',
+            ),
+      );
+    return revisions.get(v);
+  };
+  const keyMaps = new WeakMap();
+  const keyOf = (i, speed, v = voice) => {
+    let keys = keyMaps.get(v);
+    if (!keys) keyMaps.set(v, (keys = new Map()));
     const k = i + '@' + speed;
-    if (!keys.has(k)) keys.set(k, revision().then((rev) => clipKey({ engine: voice.engine || '', revision: rev, voice: voice.id || '', speed, spoken: segments[i].spoken || '' })));
+    if (!keys.has(k)) keys.set(k, revision(v).then((rev) => clipKey({ engine: v.engine || '', revision: rev, voice: v.id || '', speed, spoken: segments[i].spoken || '' })));
     return keys.get(k);
   };
   const cached = async (i, speed) => {
@@ -316,8 +327,8 @@ export function createPlayer(o = {}) {
     await appendSpeech(open, pk, ep);
   }
 
-  function feed(index, pcm, sr, speed) {
-    if (!seg || seg.index !== index) seg = { index, samples: 0, sr, speed, packets: [], drop: false };
+  function feed(index, pcm, sr, speed, v) {
+    if (!seg || seg.index !== index) seg = { index, samples: 0, sr, speed, voice: v, packets: [], drop: false };
     if (!open) open = { index, offset: seg.samples, packets: [], appended: 0, entry: null };
     live = open.packets;
     encoder(sr).encode(pcm);
@@ -389,7 +400,7 @@ export function createPlayer(o = {}) {
     stats.segments++;
     if (store && s.packets.length) {
       const clip = { sampleRate: s.sr, samples: s.samples, speed: s.speed, packets: s.packets, words };
-      keyOf(index, s.speed)
+      keyOf(index, s.speed, s.voice || voice)
         .then((k) => store && store.put(k, clip))
         .then(() => stats.cacheWrites++, () => {});
     }
@@ -433,18 +444,22 @@ export function createPlayer(o = {}) {
   }
 
   // A batch failed or was cancelled half way: keep or drop the partial segment.
+  // { index, kept, whole }: whole when the audio kept is an earlier complete rendering (the
+  // new one was dropped, too late to splice), not the start of this one.
   async function abandon(ep) {
     if (!alive(ep)) return null;
     if (!open && !seg) return null;
     const index = seg ? seg.index : open.index;
-    if (open) await closePart(ep);
+    const s = seg;
+    if (open) await closePart(ep); // may find it too late to splice: s.drop
+    const whole = !!(s && s.drop);
     seg = null;
     const first = timeline.first(index);
     if (first && first.start >= ctUs() + SPLICE_GUARD_S * 1e6 * rate()) {
       await cutAt(first.start);
-      return { index, kept: false };
+      return { index, kept: false, whole };
     }
-    return { index, kept: !!first };
+    return { index, kept: !!first, whole };
   }
 
   // Everything is appended. endOfStream() is not called: after it, seeking back from the end
@@ -517,6 +532,8 @@ export function createPlayer(o = {}) {
     let failures = 0;
     let singleUntil = -1;
     let resting = false;
+    let skipped = []; // segments skipped as unspeakable since the last batch that worked
+    let respoke = -1; // segment said again from its start after a partial one was kept
     while (alive(ep)) {
       if (pendingSplice) planSplice();
       if (nextIndex >= n) {
@@ -548,14 +565,15 @@ export function createPlayer(o = {}) {
       if (!alive(ep) || pendingSplice) continue;
       first = false;
       const batch = idx.map((i) => ({ ...segments[i], index: i }));
-      const bs = { ep, speed, done: new Set(), chunks: 0, consumed: 0, marksSeen: 0, wordsSeen: 0 };
       const ctl = new AbortController();
+      const v = voice;
+      const bs = { ep, speed, voice: v, ctl, stopped: false, done: new Set(), chunks: 0, consumed: 0, marksSeen: 0, wordsSeen: 0 };
       abortCtl = ctl;
       stats.batches++;
       const fastStart = fastNext;
       fastNext = false;
       try {
-        const res = await voice.synth(batch, {
+        const res = await v.synth(batch, {
           speed,
           signal: ctl.signal,
           fastStart,
@@ -566,37 +584,67 @@ export function createPlayer(o = {}) {
           },
         });
         if (abortCtl === ctl) abortCtl = null;
+        if (abortAfter && abortAfter.ctl === ctl) abortAfter = null;
         if (!alive(ep)) return;
         await work(() => reconcile(bs, idx, res));
         failures = 0;
-        if (alive(ep) && !ctl.signal.aborted) nextIndex = Math.max(nextIndex, idx[idx.length - 1] + 1);
+        skipped = [];
+        // Normally every segment of the batch is done; a batch stopped for setVoice() (and
+        // resolved anyway) goes on from the first one that is not.
+        const left = idx.find((i) => !bs.done.has(i));
+        if (alive(ep)) nextIndex = Math.max(nextIndex, left == null ? idx[idx.length - 1] + 1 : left);
       } catch (e) {
         if (abortCtl === ctl) abortCtl = null;
+        if (abortAfter && abortAfter.ctl === ctl) abortAfter = null;
         if (!alive(ep)) return;
-        const left = idx.find((i) => !bs.done.has(i));
         const partial = await work(() => abandon(ep));
+        if (!alive(ep)) return;
+        // Chunk handlers queued before the rejection have run by now (abandon() came after
+        // them in the queue), so bs.done is final: go on from the first segment not appended,
+        // whatever happens next (a retry, a skip, or setVoice() after a fatal error).
+        const left = idx.find((i) => !bs.done.has(i));
+        nextIndex = left == null ? idx[idx.length - 1] + 1 : left;
+        if (partial && partial.kept) {
+          // The start of this segment is being heard and the rest never came: say it again
+          // from its start after that part rather than lose the rest of the sentence; once
+          // per segment, so a call that keeps failing does not repeat its opening words.
+          if (!partial.whole && respoke !== partial.index) nextIndex = respoke = partial.index;
+          else nextIndex = partial.index + 1;
+        }
+        if (isAbort(e) && !ctl.signal.aborted) {
+          // An AbortError the player did not ask for: the voice was disposed (or its worker
+          // was stopped) and every call will fail the same way at once. setVoice() recovers.
+          return die(fail('voice', 'The voice was closed (disposed) and can no longer speak; choose a voice again.', e));
+        }
         if (isAbort(e)) {
-          // Cancelled for a speed change: carry on from the first unfinished segment (still
-          // with a fast start if nothing has been heard yet).
+          // Cancelled for a speed change or setVoice(): carry on from the first unfinished
+          // segment (still with a fast start if nothing has been heard yet).
           if (!heardSpeech && fastStart) fastNext = true;
-          if (left != null) nextIndex = partial && partial.kept ? partial.index + 1 : left;
           continue;
         }
         failures++;
         stats.failures++;
         if (e && e.code === 'unsupported') return die(fail('unsupported', e.message, e));
-        if (failures >= 4) return die(fail('voice', 'The voice failed: ' + ((e && e.message) || e), e));
+        // The engine itself is gone (WebGPU device lost, worker crashed): every later call
+        // fails the same way, so stop now instead of skipping segments one by one.
+        if (e && (e.code === 'device-lost' || e.code === 'worker-crashed')) return die(fail('voice', 'The voice failed: ' + e.message, e));
+        if (failures >= 4) {
+          // The segments skipped as unspeakable on the way here were probably fine: it was the
+          // voice that failed. setVoice() starts again from the first of them.
+          if (skipped.length) nextIndex = Math.min(nextIndex, skipped[0]);
+          return die(fail('voice', 'The voice failed: ' + ((e && e.message) || e), e));
+        }
         if (left == null) continue;
         if (partial && partial.kept) {
-          nextIndex = partial.index + 1;
+          // nextIndex is set above
         } else if (idx.length > 1) {
           // Retry one segment at a time to find the one that fails.
-          nextIndex = left;
           singleUntil = idx[idx.length - 1];
         } else {
           // This segment cannot be spoken: skip it and say so.
           cb('onError', Object.assign(fail('segment', `Segment ${segIndex(left)} could not be spoken: ${(e && e.message) || e}`, e), { index: segIndex(left) }));
           est.measure(left, 0);
+          skipped.push(left);
           nextIndex = left + 1;
         }
         await new Promise((r) => setTimeout(r, 200 * failures));
@@ -606,8 +654,8 @@ export function createPlayer(o = {}) {
 
   // Split a chunk of batch audio at segment marks and feed the encoder.
   async function handleChunk(bs, idx, c) {
-    if (!alive(bs.ep)) return;
-    const sr = c.sampleRate || voice.sampleRate || 24000;
+    if (!alive(bs.ep) || bs.stopped) return;
+    const sr = c.sampleRate || bs.voice.sampleRate || 24000;
     const end = c.start + c.pcm.length;
     let pos = Math.max(c.start, bs.consumed);
     const words = c.words || [];
@@ -616,17 +664,24 @@ export function createPlayer(o = {}) {
       if (bs.done.has(m.index)) continue;
       const upto = Math.min(m.end, end);
       if (upto > pos) {
-        feed(m.index, c.pcm.subarray(pos - c.start, upto - c.start), sr, bs.speed);
+        feed(m.index, c.pcm.subarray(pos - c.start, upto - c.start), sr, bs.speed, bs.voice);
         pos = upto;
       }
       const ws = words.filter((w) => w.index === m.index).map((w) => ({ alignIndex: w.alignIndex, start: w.start - m.start, end: w.end - m.start }));
       bs.done.add(m.index);
       await finishSeg(m.index, ws.length ? ws : null, bs.ep);
       if (!alive(bs.ep)) return;
+      if (abortAfter && abortAfter.ctl === bs.ctl && abortAfter.index === m.index) {
+        // setVoice() waited for this segment: the new voice goes on from the next one.
+        abortAfter = null;
+        bs.stopped = true;
+        if (abortCtl === bs.ctl) abortSynth();
+        return;
+      }
     }
     if (end > pos) {
       const openIdx = idx.find((i) => !bs.done.has(i));
-      if (openIdx != null) feed(openIdx, c.pcm.subarray(pos - c.start), sr, bs.speed);
+      if (openIdx != null) feed(openIdx, c.pcm.subarray(pos - c.start), sr, bs.speed, bs.voice);
     }
     bs.consumed = Math.max(bs.consumed, end);
     bs.marksSeen += (c.marks || []).length;
@@ -635,13 +690,18 @@ export function createPlayer(o = {}) {
 
   // After synth() resolves: whatever did not come through onChunk, and the real speed.
   async function reconcile(bs, idx, res) {
-    if (!alive(bs.ep)) return;
+    if (!alive(bs.ep) || bs.stopped) return;
     const marks = (res.marks || []).filter((m) => !bs.done.has(m.index));
     if (marks.length || (res.pcm && res.pcm.length > bs.consumed)) {
       const pcm = res.pcm ? res.pcm.subarray(Math.min(res.pcm.length, bs.consumed)) : new Float32Array(0);
       await handleChunk(bs, idx, { sampleRate: res.sampleRate, start: bs.consumed, pcm, marks, words: (res.words || []).filter((w) => !bs.done.has(w.index)) });
+      if (bs.stopped) return;
     }
-    for (const i of idx) if (!bs.done.has(i)) await finishSeg(i, null, bs.ep);
+    for (const i of idx)
+      if (!bs.done.has(i)) {
+        bs.done.add(i);
+        await finishSeg(i, null, bs.ep);
+      }
     if (res.speed && res.speed !== bs.speed) {
       // The engine clamped the speed: playbackRate must cover the real one.
       for (const e of timeline.entries) if (e.kind === 'speech' && idx.includes(e.index)) e.speed = res.speed;
@@ -674,6 +734,7 @@ export function createPlayer(o = {}) {
     epoch++;
     const ep = epoch;
     abortSynth();
+    abortAfter = null;
     wake();
     pendingSplice = false;
     splice = null;
@@ -869,6 +930,12 @@ export function createPlayer(o = {}) {
       }
     }
     if (fillFrom() - ct < lowUs) wake();
+    // setVoice() is waiting for the segment being heard, but the old voice is not keeping up
+    // with the playhead (filler, or the end of the audio): switch now.
+    if (abortAfter && abortCtl === abortAfter.ctl && (!here || here.kind !== 'speech' || appendEndUs - ct < 0.3e6 * rate())) {
+      abortAfter = null;
+      abortSynth();
+    }
     updatePosition(false);
 
     // Wake at the next segment boundary, and while visible at the next word, so callbacks are
@@ -954,8 +1021,6 @@ export function createPlayer(o = {}) {
       if (noPcm(v)) throw fail('unsupported', 'This voice produces no audio data (system voices use speak())');
       voice = v;
       fastNext = true;
-      keys.clear();
-      revisionP = null;
       if (fatal && (fatal.code === 'voice' || fatal.code === 'unsupported')) {
         fatal = null;
         epoch++;
@@ -968,7 +1033,14 @@ export function createPlayer(o = {}) {
         });
         setState(audio.paused ? 'paused' : heardSpeech ? 'buffering' : 'loading');
       }
-      abortSynth(); // the producer carries on from the first unfinished segment
+      // The producer carries on from the first unfinished segment. A segment already being
+      // heard is finished with the old voice first (cutting it would lose the rest of the
+      // sentence): the running batch stops once that segment is complete.
+      const cur = open ? open.index : seg ? seg.index : null;
+      const curFirst = cur == null ? null : timeline.first(cur);
+      const curStart = curFirst ? curFirst.start : appendEndUs;
+      if (abortCtl && cur != null && !(seg && seg.drop) && curStart < ctUs() + 2 * SPLICE_GUARD_S * 1e6 * rate()) abortAfter = { ctl: abortCtl, index: cur };
+      else abortSynth();
       wake();
       if (running !== epoch) {
         eos = false;
@@ -986,12 +1058,17 @@ export function createPlayer(o = {}) {
       if (regenTimer) clearTimeout(regenTimer);
       regenTimer = setTimeout(regenerate, regenMs);
     },
-    // Ogg/Opus of the document from the clip cache at the current model speed.
+    // Ogg/Opus of the document from the clip cache at the current model speed:
+    // { blob (audio/ogg), missing (indexes of segments in from..to not in the cache, left
+    // out of the file), packets (Opus packets written) }.
     async exportOgg({ from = 0, to = n, tags } = {}) {
       if (!store) throw fail('unsupported', 'No clip cache');
+      const a = Math.max(0, Math.min(n, Math.floor(+from) || 0));
+      const b = Math.max(a, Math.min(n, Number.isFinite(+to) && to !== null ? Math.floor(+to) : n));
       const ks = [];
-      for (let i = from; i < to; i++) ks.push(await keyOf(i, genSpeed));
-      return store.exportOgg(ks, { tags: { title: o.metadata && o.metadata.title, artist: o.metadata && o.metadata.artist, ...tags } });
+      for (let i = a; i < b; i++) ks.push(await keyOf(i, genSpeed));
+      const out = await store.exportOgg(ks, { tags: { title: o.metadata && o.metadata.title, artist: o.metadata && o.metadata.artist, ...tags } });
+      return { blob: out.blob, missing: out.missing.map((k) => a + k), packets: out.packets };
     },
     destroy() {
       if (destroyed) return;

@@ -176,6 +176,33 @@ export async function domToBlocks(root, opts) {
   }
 
   const counters = new Map();
+  // where a table cell sits: { table, row, col } (column counts colspans)
+  const tableIds = new Map();
+  const tableRows = new Map();
+  const tag = (n) => (n && n.localName ? n.localName.toLowerCase() : '');
+  const cellPos = (el) => {
+    const tr = el.parentNode;
+    if (tag(tr) !== 'tr') return undefined;
+    let table = tr.parentNode;
+    while (table && tag(table) !== 'table') table = table.parentNode;
+    if (!table) return undefined;
+    if (!tableIds.has(table)) {
+      tableIds.set(table, tableIds.size);
+      const own = [];
+      for (const r of table.querySelectorAll('tr')) {
+        let t = r.parentNode;
+        while (t && tag(t) !== 'table') t = t.parentNode;
+        if (t === table) own.push(r);
+      }
+      tableRows.set(table, own);
+    }
+    let col = 0;
+    for (const c of tr.children) {
+      if (c === el) break;
+      if (tag(c) === 'td' || tag(c) === 'th') col += +(c.getAttribute('colspan') || 1) || 1;
+    }
+    return { table: tableIds.get(table), row: tableRows.get(table).indexOf(tr), col };
+  };
   let buf = '';
   const flush = (ctx) => {
     let t = buf;
@@ -185,7 +212,7 @@ export async function domToBlocks(root, opts) {
       t = ctx.li.prefix + ' ' + t.trimStart();
       ctx.li.prefix = '';
     }
-    blocks.push(makeBlock(ctx.type, t, { page: o.page, source: o.source, skip: ctx.skip || o.skip }));
+    blocks.push(makeBlock(ctx.type, t, { page: o.page, source: o.source, skip: ctx.skip || o.skip, cell: ctx.type === 'cell' ? ctx.cell : undefined }));
   };
   const addText = (data) => {
     let s = data.replace(/[ \t\n\r\f]+/g, ' ');
@@ -197,7 +224,7 @@ export async function domToBlocks(root, opts) {
   };
 
   const childCtx = (el, tag, parent) => {
-    const c = { type: parent.inherit ? parent.type : 'p', skip: parent.skip, inherit: parent.inherit, li: parent.li };
+    const c = { type: parent.inherit ? parent.type : 'p', skip: parent.skip, inherit: parent.inherit, li: parent.li, cell: parent.cell };
     const cls = attr(el, 'class');
     const id = attr(el, 'id');
     if (/^h[1-6]$/.test(tag)) {
@@ -217,6 +244,7 @@ export async function domToBlocks(root, opts) {
       const short = el.textContent.length < 300;
       c.type = short ? 'cell' : 'p';
       c.inherit = short;
+      c.cell = cellPos(el);
     } else if (tag === 'figcaption' || tag === 'caption') {
       c.type = 'caption';
       c.skip = c.skip || 'caption';

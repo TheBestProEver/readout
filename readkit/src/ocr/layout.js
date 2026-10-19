@@ -54,15 +54,17 @@ function widestGap(ranges, minGap) {
 
 // Columns sit side by side: most lines of the smaller side have a neighbour at
 // the same height on the other side. Chat bubbles alternate instead, and must be
-// read top to bottom.
+// read top to bottom. A smaller side that is one row (the right half of a tab
+// strip spread wider than the text under it) is part of a row, not a column.
 function sideBySide(L, R) {
   const [few, many] = L.length <= R.length ? [L, R] : [R, L];
   let paired = 0;
   for (const a of few) if (many.some((b) => b.top < a.bot && a.top < b.bot)) paired++;
-  return few.length >= 2 && paired / few.length >= 0.4;
+  const rows = few.some((a) => few.some((b) => b.top >= a.bot));
+  return few.length >= 2 && rows && paired / few.length >= 0.4;
 }
 
-function xycut(segs, depth) {
+export function xycut(segs, depth = 0) {
   if (segs.length <= 1 || depth > 40) return [segs];
   const med = median(segs.map((s) => s.size));
   const gx = widestGap(segs.map((s) => [s.x0, s.x1]), med * 1.2);
@@ -150,8 +152,10 @@ export function paragraphs(ordered) {
         const usual = st.pitch || prev.size * 1.5;
         const indent = s.x0 - st.left > Math.max(1.2 * s.size, 0.04 * (st.right - st.left)) && s.x0 - prev.x0 > s.size;
         const short = prev.x1 < st.right - Math.max(3 * prev.size, 0.15 * (st.right - st.left)) && TERMINAL.test(prev.text);
-        const sizeJump = Math.abs(s.size - prev.size) > 0.3 * Math.min(s.size, prev.size);
-        fresh = pitch > usual * 1.45 || pitch < s.size * 0.5 || (indent && !runOn) || (short && !runOn) || sizeJump;
+        // a sentence running on stays one paragraph across loose spacing (1.6x lines after
+        // tighter ones) and the size wobble of OCR line heights; only a blank line splits it
+        const sizeJump = Math.abs(s.size - prev.size) > (runOn ? 0.5 : 0.3) * Math.min(s.size, prev.size);
+        fresh = pitch > usual * (runOn ? 2.2 : 1.45) || pitch < s.size * 0.5 || (indent && !runOn) || (short && !runOn) || sizeJump;
         // continuation lines of a list item stay with it
         if (fresh && cur.bullet && !sizeJump && pitch <= usual * 1.45 && s.x0 > cur.lines[0].x0 + s.size * 0.5) fresh = false;
       }

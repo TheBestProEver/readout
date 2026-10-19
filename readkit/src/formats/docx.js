@@ -307,7 +307,8 @@ export async function readDocx(zip, ctx) {
   const blocks = [];
   const warnings = [];
 
-  const emitPara = (p, inCell, into, state) => {
+  let tableCount = 0;
+  const emitPara = (p, inCell, into, state, cellPos) => {
     const pPr = kid(p, 'w:pPr');
     const pstyle = styles.para(val(kid(pPr, 'w:pStyle')));
     const kind = styleKind(pstyle);
@@ -335,7 +336,7 @@ export async function readDocx(zip, ctx) {
         if (lab) text = lab + ' ' + text;
         if (!heading) type = 'li';
       }
-      if (text.trim()) into.push(makeBlock(type, text, { page, skip: type === 'caption' ? 'caption' : undefined }));
+      if (text.trim()) into.push(makeBlock(type, text, { page, skip: type === 'caption' ? 'caption' : undefined, cell: inCell ? cellPos : undefined }));
     }
     for (const box of deferred) {
       for (const k of box.children) {
@@ -356,18 +357,26 @@ export async function readDocx(zip, ctx) {
     return out;
   };
   const emitTable = (tbl, into, state) => {
+    const table = tableCount++;
+    let r = 0;
     for (const row of within(tbl, 'w:tr', [])) {
       if (kid(kid(row, 'w:trPr'), 'w:del')) continue; // a deleted row
+      let col = 0;
       for (const cell of within(row, 'w:tc', [])) {
+        // (a cell spanning columns moves the next one along)
+        const span = +(val(kid(kid(cell, 'w:tcPr'), 'w:gridSpan')) || 1) || 1;
+        const pos = { table, row: r, col };
         for (const k of cell.children) {
           if (typeof k === 'string') continue;
-          if (k.name === 'w:p') emitPara(k, true, into, state);
+          if (k.name === 'w:p') emitPara(k, true, into, state, pos);
           else if (k.name === 'w:tbl') emitTable(k, into, state);
           else if (k.name === 'w:sdt' || k.name === 'w:customXml') {
-            for (const p of within(k, 'w:p', [])) emitPara(p, true, into, state);
+            for (const p of within(k, 'w:p', [])) emitPara(p, true, into, state, pos);
           }
         }
+        col += span;
       }
+      r++;
     }
   };
 

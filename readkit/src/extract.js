@@ -276,7 +276,7 @@ async function readTextDoc(kind, bytes, ctx) {
   if (kind === 'mhtml' || kind === 'eml') return (await READERS.html()).readMimeDoc(bytes, { pause, url: opts.url });
   if (kind === 'html') {
     const text = decodeText(bytes, { charset: declaredCharset(bytes) }).text;
-    return (await READERS.html()).readHtml(text, { pause, url: opts.url });
+    return (await READERS.html()).readHtml(text, { pause, url: opts.url, layout: !!opts.layout });
   }
   if (kind === 'odt' || kind === 'odp') {
     // Flat OpenDocument XML (.fodt, .fodp)
@@ -298,7 +298,7 @@ async function readPlain(text, ctx) {
       words = null;
     }
   }
-  return { title: '', blocks: await textToBlocksAsync(text, { words, source: 'text' }, ctx.pause), warnings: [] };
+  return { title: '', blocks: await textToBlocksAsync(text, { words, source: 'text' }, ctx.pause), warnings: [], plain: text };
 }
 
 /* ---------- extract ---------- */
@@ -306,7 +306,8 @@ async function readPlain(text, ctx) {
 /**
  * input: File | Blob | ArrayBuffer | Uint8Array | string (plain text; Markdown and HTML are
  * recognised). opts: { name, ocr: 'auto'|'always'|'never', dialect, allowOcr, signal,
- * onProgress, onBlock, url (for saved web pages) }.
+ * onProgress, onBlock, url (for saved web pages), layout (also give doc.layout: lines with
+ * their boxes, rows, tables and label/value pairs; see src/layout/layout.js) }.
  */
 export async function extract(input, opts) {
   const o = Object.assign({ ocr: 'auto', dialect: 'en-US' }, opts);
@@ -332,6 +333,8 @@ export async function extract(input, opts) {
     }
   };
   const ctx = { opts: o, load, pause, warnings, stream };
+  // what the layout is built from: { pages } (PDFs, pictures), { text } (plain text), else the blocks
+  let layoutSrc = {};
   const progress = (stage, done, total, message) => {
     if (o.onProgress) o.onProgress({ stage, done, total, message });
   };
@@ -367,6 +370,10 @@ export async function extract(input, opts) {
     const id = await idP;
     throwIfAborted(signal);
     const doc = makeDoc({ id, kind: fields.kind, title: chooseTitle(fields.title, blocks, name), blocks, warnings: normalizeWarnings(warnings), stats });
+    if (o.layout) {
+      const { layoutOf } = await import('./layout/layout.js');
+      doc.layout = layoutOf(doc, layoutSrc);
+    }
     progress('done', 1, 1, '');
     return doc;
   };
@@ -386,6 +393,10 @@ export async function extract(input, opts) {
       const r = await readTextDoc(kind, src, ctx);
       stream(markReferences(r.blocks));
       warnings.push(...(r.warnings || []));
+      if (kind === 'text') layoutSrc = { text: plain };
+      // (a web page's dates and addresses the article left out: as for a file)
+      if (r.layoutBlocks) layoutSrc = { blocks: r.layoutBlocks };
+      if (r.layoutHtml != null) layoutSrc.html = r.layoutHtml;
       return await finish({ kind, title: r.title, stats: { pages: 0 } });
     }
 
@@ -421,7 +432,9 @@ export async function extract(input, opts) {
         createOcr: o.createOcr,
         createCorrector: o.createCorrector,
         onBlock: (b) => stream([b]),
+        layout: !!o.layout,
       });
+      if (r.layout) layoutSrc = { pages: r.layout.pages };
       // A PDF that pdf.js can't open at all is damaged, like a broken ZIP: an error, not an
       // empty Doc. (Password-protected PDFs come back as a Doc with a 'drm' warning.)
       if (!(r.blocks || []).length && !(r.stats && r.stats.pages) && (r.warnings || []).some((w) => w.type === 'unsupported')) throw failure(null, name);
@@ -447,7 +460,8 @@ export async function extract(input, opts) {
       const { ocrImage } = await load.ocr();
       // ocrImage titles a picture by the name it is given; a camera's "IMG_2041" is no title.
       const meaningful = name && !autoName(name) ? name : '';
-      const r = await ocrImage(blob, { dialect: o.dialect, allowOcr: o.allowOcr, signal, onProgress: o.onProgress, name: meaningful, createOcr: o.createOcr, createCorrector: o.createCorrector });
+      const r = await ocrImage(blob, { dialect: o.dialect, allowOcr: o.allowOcr, signal, onProgress: o.onProgress, name: meaningful, createOcr: o.createOcr, createCorrector: o.createCorrector, layout: !!o.layout });
+      if (r.layout) layoutSrc = { pages: r.layout.pages };
       stream(r.blocks || []);
       warnings.push(...(r.warnings || []));
       // A meaningful file name beats the opening words of the OCR'd text, which beat "Picture".
@@ -497,6 +511,9 @@ export async function extract(input, opts) {
       const r = await readTextDoc(kind, bytes, ctx);
       stream(markReferences(r.blocks));
       warnings.push(...(r.warnings || []));
+      if (r.plain != null) layoutSrc = { text: r.plain };
+      if (r.layoutBlocks) layoutSrc = { blocks: r.layoutBlocks };
+      if (r.layoutHtml != null) layoutSrc.html = r.layoutHtml;
       const docKind = kind === 'mhtml' || kind === 'eml' ? r.kind || 'html' : kind;
       if (!blocks.length && !warnings.length) warnings.push(warning('unsupported', 'No text was found in this file.'));
       return await finish({ kind: docKind, title: r.title, stats: { pages: r.pages || 0 } });

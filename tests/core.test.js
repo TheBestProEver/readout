@@ -214,15 +214,46 @@ test('formatDuration and relativeTime', () => {
 
 /* ---------- the service worker's list of readkit files ---------- */
 
-test('sw.js caches every readkit runtime file (tools/readkit-files.mjs keeps the list)', () => {
-  const root = path.join(__dirname, '..');
-  const sw = fs.readFileSync(path.join(root, 'sw.js'), 'utf8');
-  const m = /\/\/ readkit files: begin\n([\s\S]*?)\n\s*\/\/ readkit files: end/.exec(sw);
+const ROOT = path.join(__dirname, '..');
+const kitTool = () => import(require('url').pathToFileURL(path.join(ROOT, 'tools', 'readkit-files.mjs')).href);
+const swText = () => fs.readFileSync(path.join(ROOT, 'sw.js'), 'utf8');
+const kitVersionIn = (text) => (/const KIT_VERSION = '([^']*)';/.exec(text) || [])[1];
+
+test('sw.js caches every readkit runtime file, with its fingerprint (tools/readkit-files.mjs keeps the list)', async () => {
+  const m = /\/\/ readkit files: begin\r?\n([\s\S]*?)\r?\n\s*\/\/ readkit files: end/.exec(swText());
   assert.ok(m, 'the list markers are in sw.js');
   const listed = JSON.parse('[' + m[1].replace(/,\s*$/, '') + ']');
-  const walk = (dir) => fs.readdirSync(path.join(root, dir), { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(dir + '/' + e.name) : [dir + '/' + e.name]));
-  const actual = ['readkit/index.js', ...walk('readkit/src'), ...walk('readkit/data').filter((f) => !/\.md$/.test(f))].sort();
-  assert.deepStrictEqual(listed.slice().sort(), actual);
+  const walk = (dir) => fs.readdirSync(path.join(ROOT, dir), { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(dir + '/' + e.name) : [dir + '/' + e.name]));
+  const actual = [...fs.readdirSync(path.join(ROOT, 'readkit')).filter((n) => /\.js$/.test(n)).map((n) => 'readkit/' + n), ...walk('readkit/src'), ...walk('readkit/data').filter((f) => !/\.md$/.test(f))].sort();
+  assert.deepStrictEqual(listed.map((e) => e[0]).sort(), actual);
+  // readkit's supported entry points (Readout imports these, not src/ files)
+  for (const f of ['readkit/index.js', 'readkit/voice.js', 'readkit/player.js']) assert.ok(actual.includes(f), f);
+  const { fingerprint, kitManifest } = await kitTool();
+  for (const [f, h] of listed) assert.strictEqual(h, fingerprint(fs.readFileSync(path.join(ROOT, f))), 'fingerprint of ' + f);
+  assert.strictEqual(kitVersionIn(swText()), kitManifest().kitVersion, 'KIT_VERSION in sw.js');
+});
+
+test('app.js is made for the readkit sw.js keeps, and loads it only through its entry points', () => {
+  const app = fs.readFileSync(path.join(ROOT, 'app.js'), 'utf8');
+  assert.strictEqual(kitVersionIn(app), kitVersionIn(swText()), 'KIT_VERSION in app.js and sw.js');
+  const imports = [...app.matchAll(/import\(\s*'([^']+)'\s*\)/g)].map((x) => x[1]);
+  assert.ok(imports.length >= 3, 'readkit imports found');
+  for (const i of imports) assert.ok(/^\.\/readkit\/(index|voice|player)\.js$/.test(i), 'import of ' + i);
+  // and sw.js keeps the page shell the index.html asks for
+  const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8');
+  for (const asset of html.match(/(?:styles\.css|core\.js|app\.js)\?v=\d+/g)) assert.ok(swText().includes(`'${asset}'`), asset + ' in the SHELL list');
+});
+
+test('sw.js fingerprints a file as tools/readkit-files.mjs does (CRLF read as LF)', async () => {
+  const src = /async function fingerprint\(buf\) \{[\s\S]*?\n\}/.exec(swText());
+  assert.ok(src, 'fingerprint() in sw.js');
+  const swPrint = new Function('crypto', src[0] + '\nreturn fingerprint;')(globalThis.crypto);
+  const { fingerprint } = await kitTool();
+  const enc = (s) => new TextEncoder().encode(s);
+  const samples = [enc(''), enc('a\r\nb\rc\n'), enc('a\nb\rc\n'), enc('\r'), enc('x\r\n'), fs.readFileSync(path.join(ROOT, 'readkit/index.js'))];
+  for (const b of samples) assert.strictEqual(await swPrint(b), fingerprint(b));
+  assert.strictEqual(fingerprint(enc('a\r\nb')), fingerprint(enc('a\nb')));
+  assert.notStrictEqual(fingerprint(enc('a\rb')), fingerprint(enc('a\nb')));
 });
 
 /* ---------- speed ---------- */

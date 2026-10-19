@@ -409,6 +409,98 @@ export function scaleFor(glyph, w, h) {
   return f;
 }
 
+// Light text on dark panels inside a light page (a dark title bar, a button, the dark side of
+// a flyer): flattening takes the brightest pixels for the paper, which there are the letters,
+// and wipes them out. Such panels are turned light first. A panel is a run of blocks whose
+// median is dark (at least 3 of them, or one with light strokes in it), so the inside of a
+// big black letter (dark, but with nothing light in it) is left alone.
+// Returns { g, blocks } with the panels inverted, or null when there are none.
+export function localInvert(g, w, h) {
+  const paper = percentile(histogram(g, 7), 0.9);
+  if (paper < 140) return null;
+  const B = Math.max(16, Math.round(Math.min(w, h) / 24));
+  const bw = Math.ceil(w / B);
+  const bh = Math.ceil(h / B);
+  const med = new Uint8Array(bw * bh);
+  const hi = new Uint8Array(bw * bh);
+  const hist = new Uint32Array(256);
+  for (let by = 0; by < bh; by++) {
+    for (let bx = 0; bx < bw; bx++) {
+      hist.fill(0);
+      let n = 0;
+      const y1 = Math.min(h, (by + 1) * B);
+      const x1 = Math.min(w, (bx + 1) * B);
+      for (let y = by * B; y < y1; y += 2) {
+        const r = y * w;
+        for (let x = bx * B; x < x1; x += 2) {
+          hist[g[r + x]]++;
+          n++;
+        }
+      }
+      let acc = 0;
+      let m = -1;
+      let q = -1;
+      for (let v = 0; v < 256; v++) {
+        acc += hist[v];
+        if (m < 0 && acc >= n * 0.5) m = v;
+        if (q < 0 && acc >= n * 0.97) q = v;
+      }
+      med[by * bw + bx] = m;
+      hi[by * bw + bx] = q;
+    }
+  }
+  const dark = (i) => med[i] < 0.45 * paper;
+  const seen = new Uint8Array(bw * bh);
+  const flip = new Uint8Array(bw * bh);
+  let count = 0;
+  for (let i = 0; i < bw * bh; i++) {
+    if (seen[i] || !dark(i)) continue;
+    const comp = [];
+    const stack = [i];
+    seen[i] = 1;
+    while (stack.length) {
+      const k = stack.pop();
+      comp.push(k);
+      const x = k % bw;
+      const y = (k / bw) | 0;
+      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const xx = x + dx;
+        const yy = y + dy;
+        if (xx < 0 || yy < 0 || xx >= bw || yy >= bh) continue;
+        const j = yy * bw + xx;
+        if (!seen[j] && dark(j)) {
+          seen[j] = 1;
+          stack.push(j);
+        }
+      }
+    }
+    const light = comp.filter((k) => hi[k] > 0.65 * paper).length;
+    // empty stretches of the panel itself: blocks with nothing light in them at all
+    const solid = comp.filter((k) => hi[k] < 0.45 * paper).length;
+    // a whole-page dark area is the page itself (handled by inverting everything)
+    if (comp.length >= 0.6 * bw * bh) continue;
+    // a panel has light strokes and plain dark margins; big bold letters have no margins
+    if (comp.length >= 4 && light >= 1 && solid >= Math.max(2, 0.2 * comp.length)) {
+      for (const k of comp) flip[k] = 1;
+      count += comp.length;
+    }
+  }
+  if (!count) return null;
+  const out = new Uint8ClampedArray(g);
+  for (let by = 0; by < bh; by++) {
+    for (let bx = 0; bx < bw; bx++) {
+      if (!flip[by * bw + bx]) continue;
+      const y1 = Math.min(h, (by + 1) * B);
+      const x1 = Math.min(w, (bx + 1) * B);
+      for (let y = by * B; y < y1; y++) {
+        const r = y * w;
+        for (let x = bx * B; x < x1; x++) out[r + x] = 255 - out[r + x];
+      }
+    }
+  }
+  return { g: out, blocks: count };
+}
+
 // The 'auto' pipeline. Returns the prepared gray image and what was done.
 // kind 'screenshot' skips the denoise: UI text is sharp and small.
 export function preprocess(g, w, h, { kind = 'photo' } = {}) {
@@ -418,6 +510,11 @@ export function preprocess(g, w, h, { kind = 'photo' } = {}) {
   if (info.median < 110) {
     out = invert(out);
     info.inverted = true;
+  }
+  const panels = localInvert(out, w, h);
+  if (panels) {
+    out = panels.g;
+    info.panels = panels.blocks;
   }
   if (kind !== 'screenshot') out = box3(out, w, h);
   out = flatten(out, w, h);

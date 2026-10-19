@@ -25,7 +25,19 @@ function sayDate(d, mo, y, ctx, theBefore) {
 
 const ISO = /(?<![\d\-/.])(\d{4})-(\d{2})-(\d{2})(?![\d\-/]|\.\d)/g;
 const NUMERIC = /(?<![\d/.\-:])(\d{1,2})([/.\-])(\d{1,2})\2(\d{4}|\d{2})(?![\d/\-:]|\.\d)/g;
-const SHORT = /(?<=\b(?:[Oo]n|[Bb]y|[Uu]ntil|[Tt]ill|[Ff]rom|[Ss]ince|[Bb]efore|[Aa]fter|[Tt]hrough|[Tt]hru|[Dd]ue|[Dd]ated|[Ss]tarting|[Ee]nding|[Ee]ffective|of|[Ee]xpires|[Ee]xpiring|[Dd]eadline)\s)(\d{1,2})\/(\d{1,2})(?![\d/]|\.\d)/g;
+const SHORT = /(?<=\b(?:[Oo]n|[Bb]y|[Uu]ntil|[Tt]ill|[Ff]rom|[Ss]ince|[Bb]efore|[Aa]fter|[Tt]hrough|[Tt]hru|[Dd]ue|[Dd]ated|[Ss]tarting|[Ee]nding|[Ee]ffective|of|[Ee]xpires|[Ee]xpiring|[Dd]eadline)[:,]?\s)(\d{1,2})\/(\d{1,2})(?![\d/]|\.\d)/g;
+// A month/day with no cue word ('Midterm 10/22 at 2pm', 'Mon 10/7', 'closed 12/24-12/26'):
+// a date when a weekday comes right before it, or when its day is past 12 and is no usual
+// fraction denominator (16, 20, 25) and no unit, counted noun, 'of' or 'scale' follows. A
+// day of 12 or less with no weekday stays a fraction ('Answer: 3/4', '1/2-3/4 cup').
+const BARE = /(?<![\w/.,:⁄$\-])(?:(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|Mon|Tues|Tue|Wed|Thurs|Thur|Thu|Fri|Sat|Sun)(\.?,?\s+))?(\d{1,2})\/(\d{1,2})(?![\d/]|[.,]\d)/g;
+// the second date of a range whose first date was just read: '12/24-12/26'
+const RANGE_TAIL = /(?<=(?:\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s[a-z]+(?:-[a-z]+)?(?:st|nd|rd|th)|\bof\s(?:January|February|March|April|May|June|July|August|September|October|November|December))\s?)[–\-]\s?(\d{1,2})\/(\d{1,2})(?![\d/]|[.,]\d)/g;
+const BARE_NOT_AFTER = /^(?:\s*(?:[-–]\s*)?(?:of|scale|inch|inches|ft|foot|feet|yd|yard|mile|miles|cup|cups|teaspoons?|tablespoons?|tsp|tbsp|oz|ounces?|pounds?|lbs?|grams?|kg|mm|cm|km|ml|mph|odds|th|ths)\b|\s*%)/i;
+const BARE_PLURAL = /^\s+([a-z]+s)\b/;
+const BARE_SPECIAL = ['24/7', '22/7', '9/11', '7/11', '20/20', '50/50'];
+const NOT_PLURAL = /^(?:is|was|has|as|its|this|his|us|thus|plus|yes|class|pass|less|across|always|perhaps|bus|campus|focus|news|series|status|address|access|process|business)$/;
+const BARE_NOT_BEFORE = /\b(?:scored?|scoring|got|gets|rated?|earned|marks?|grade[sd]?|ratio|odds|approximately|about|roughly|nearly|almost)\s+$/i;
 const MONTH_FIRST = new RegExp(`\\b${MON}\\s${DAY}(?:\\s?(?:[–\\-]|to)\\s?${DAY})?(?![\\d:])(?:(,?\\s)(\\d{4})(?!\\d))?`, 'g');
 const DAY_FIRST = new RegExp(`(?<![\\w.,:/])(?:([Tt]he)\\s)?${DAY}(?:\\s?([–\\-]|to|and)\\s?(?:the\\s)?${DAY})?\\s(?:of\\s)?${MON}(?![a-z])(?:(,?\\s)(\\d{4})(?!\\d))?`, 'g');
 const WEEKDAY = new RegExp(`\\b(Mon|Tues|Tue|Wed|Thurs|Thur|Thu|Fri|Sat|Sun)(?:\\.(?=,?\\s+(?:\\d|the\\b|at\\b|${MON}))|(?=,?\\s+\\d{1,2}(?:st|nd|rd|th)?\\s+${MON}|,?\\s+${MON}\\s+\\d))`, 'g');
@@ -38,6 +50,40 @@ const MONTHNAME = '(January|February|March|April|May|June|July|August|September|
 const DAY_RANGE = new RegExp(`\\b${DAYNAME}\\s?(?:[–—-]|\\bto\\b|\\bthrough\\b|\\bthru\\b)\\s?${DAYNAME}(?![\\w-])`, 'g');
 const MONTH_RANGE = new RegExp(`\\b${MONTHNAME}\\s?[–—-]\\s?${MONTHNAME}(?![\\w-])`, 'g');
 const fullDay = (d) => WEEKDAYS[d] || d;
+
+// [day, month index] of an 'a/b' month/day in the dialect's order, or null.
+function monthDay(a, b, ctx) {
+  const dayFirst = ctx.dateOrder ? ctx.dateOrder === 'DMY' : ctx.uk;
+  let d;
+  let mo;
+  if (a > 12 && b <= 12) [d, mo] = [a, b];
+  else if (b > 12 && a <= 12) [mo, d] = [a, b];
+  else if (dayFirst) [d, mo] = [a, b];
+  else [mo, d] = [a, b];
+  return mo >= 1 && mo <= 12 && validDay(d, mo - 1) ? [d, mo - 1] : null;
+}
+
+function bareDate(m, s, ctx) {
+  const [, wd, sep, A, B] = m;
+  const a = +A;
+  const b = +B;
+  const md = monthDay(a, b, ctx);
+  if (!md || BARE_SPECIAL.includes(A + '/' + B)) return null;
+  const end = m.index + m[0].length;
+  const after = s.slice(end, end + 24);
+  if (!wd) {
+    // only in the dialect's own order, with the day (the second field in the US) past 12 and
+    // not 16, 20 or 25: '24/7' and '22/7' stay what they are
+    const dayFirst = ctx.dateOrder ? ctx.dateOrder === 'DMY' : ctx.uk;
+    const day = md[0];
+    if (day !== (dayFirst ? a : b) || day < 13 || [16, 20, 25].includes(day)) return null;
+    if (BARE_NOT_AFTER.test(after) || BARE_NOT_BEFORE.test(s.slice(Math.max(0, m.index - 16), m.index))) return null;
+    const noun = BARE_PLURAL.exec(after);
+    if (noun && !NOT_PLURAL.test(noun[1])) return null;
+  }
+  const date = sayDate(md[0], md[1], '', ctx, precededByThe(s, m.index));
+  return wd ? fullDay(wd) + sep.replace('.', '') + date : date;
+}
 
 export function dateRules(t, ctx) {
   t.replace(DAY_RANGE, (m) => `${fullDay(m[1])} to ${fullDay(m[2])}`);
@@ -86,6 +132,13 @@ export function dateRules(t, ctx) {
       if (mo < 1 || mo > 12 || !validDay(d, mo - 1)) return null;
       return sayDate(d, mo - 1, '', ctx, precededByThe(s, m.index));
     });
+    if (/\d\/\d/.test(t.s)) {
+      t.replace(BARE, (m, s) => bareDate(m, s, ctx));
+      t.replace(RANGE_TAIL, (m) => {
+        const md = monthDay(+m[1], +m[2], ctx);
+        return md ? ' to ' + sayDate(md[0], md[1], '', ctx, false) : null;
+      });
+    }
   }
   t.replace(MONTH_FIRST, (m) => {
     const mo = monthOf(m[1]);
@@ -120,7 +173,8 @@ export function dateRules(t, ctx) {
 
 const TP = '([01]?\\d|2[0-3])(?:([:.])([0-5]\\d))?(?::([0-5]\\d))?(?:\\s?([AaPp])\\.?\\s?[Mm](\\.?)(?![a-z]))?';
 const TIME_RANGE = new RegExp(`(?<![\\d:.,\\w])${TP}\\s?(?:[–\\-]|to)\\s?${TP}(?![\\d:]|\\.\\d)`, 'g');
-const TIME = new RegExp(`(?<![\\d:.,\\w])${TP}(?![\\d:]|\\.\\d)`, 'g');
+// not the start of a map scale: '1:50,000'
+const TIME = new RegExp(`(?<![\\d:.,\\w])${TP}(?![\\d:]|\\.\\d|,\\d{3}(?!\\d))`, 'g');
 
 const DOT_BEFORE = /\b(?:at|At|the|The|from|From|until|Until|till|before|after|around|to)\s$/;
 const DOT_AFTER = /^(?:\s*(?:$|[,;:!?)]|\.(?!\d))|\s+(?:to|from|train|service|bus|coach|flight|ferry|departure|arrival|sailing|on|tomorrow|today|tonight|this|every|each|until|till|sharp|start|kick-off|kickoff|meeting|appointment)\b)/;

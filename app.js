@@ -7,6 +7,8 @@
 
   const Core = window.ReadoutCore;
   const VERSION = '2.0.0';
+  // The readkit this app.js goes with (written by tools/readkit-files.mjs, as in sw.js).
+  const KIT_VERSION = '0.2.0-42d3dde-6f0f2260';
   const CONFIG = Object.assign(
     {
       githubApi: 'https://api.github.com',
@@ -127,8 +129,11 @@
 
   /* ================= readkit ================= */
 
-  // The text side (extract, plan) loads at start; voices and the player load when needed.
-  const kit = { K: null, system: null, autoName: null, V: null, P: null };
+  // The text side (extract, plan) loads at start; voices and the player load when needed,
+  // all through readkit's supported entry points (index.js, voice.js, player.js).
+  // from: the readkit version the page loaded (the service worker's, or this one from the
+  // server); stale: a service worker with another readkit has taken over the page since.
+  const kit = { K: null, autoName: null, V: null, P: null, from: null, stale: false };
 
   // Dev override (never on by default): ?local=<http://127.0.0.1:port> points the voice models
   // and their runtime at a local server (the layout of readkit's tests/fixtures/voice/server.mjs).
@@ -147,23 +152,119 @@
   }
 
   async function loadKit() {
-    const [K, system, ex] = await Promise.all([import('./readkit/index.js'), import('./readkit/src/voice/system.js'), import('./readkit/src/extract.js')]);
+    kit.from = await kitSource().catch(() => KIT_VERSION);
+    watchKitVersion();
+    const K = await import('./readkit/index.js');
     if (CONFIG.readkit) K.configure(CONFIG.readkit);
     const local = localModels();
     if (local) K.configure(local);
     kit.K = K;
-    kit.system = system;
-    kit.autoName = ex.autoName;
+    kit.autoName = K.autoName;
   }
 
   function voiceModule() {
-    if (!kit.Vp) kit.Vp = import('./readkit/src/voice/voice.js').then((m) => (kit.V = m)).catch((e) => ((kit.Vp = null), Promise.reject(e)));
+    if (!kit.Vp) kit.Vp = import('./readkit/voice.js').then((m) => (kit.V = m)).catch((e) => ((kit.Vp = null), Promise.reject(e)));
     return kit.Vp;
   }
 
   function playerModule() {
-    if (!kit.Pp) kit.Pp = import('./readkit/src/audio/player.js').then((m) => (kit.P = m)).catch((e) => ((kit.Pp = null), Promise.reject(e)));
+    if (!kit.Pp) kit.Pp = import('./readkit/player.js').then((m) => (kit.P = m)).catch((e) => ((kit.Pp = null), Promise.reject(e)));
     return kit.Pp;
+  }
+
+  // Which readkit the service worker serves (sw.js KIT_VERSION), or null for a worker that
+  // doesn't say (1.x's, which keeps no readkit) or none.
+  function askKitVersion(ms) {
+    const c = navigator.serviceWorker && navigator.serviceWorker.controller;
+    if (!c || typeof MessageChannel === 'undefined') return Promise.resolve(null);
+    return new Promise((resolve) => {
+      const ch = new MessageChannel();
+      const t = setTimeout(() => resolve(null), ms);
+      ch.port1.onmessage = (e) => {
+        clearTimeout(t);
+        resolve((e.data && e.data.kit) || null);
+      };
+      try {
+        c.postMessage({ type: 'kit-version' }, [ch.port2]);
+      } catch (e) {
+        clearTimeout(t);
+        resolve(null);
+      }
+    });
+  }
+
+  // The service worker answers readkit's files from the copy it keeps, and the first start
+  // after a release still goes through the old worker: it would give this new app.js the old
+  // readkit, then (once the new worker takes over) a mix of both. So when the worker keeps
+  // another readkit, wait for the new one (it takes only the changed files from the network)
+  // before loading readkit. Returns the version readkit will come from.
+  const KIT_WAIT = 30000;
+  async function kitSource() {
+    const sw = navigator.serviceWorker;
+    if (!sw || !sw.controller) return KIT_VERSION; // from the server
+    const keys = self.caches ? await caches.keys() : [];
+    if (!keys.some((k) => k.startsWith('readout-kit-'))) return KIT_VERSION; // a worker that keeps no readkit
+    let v = await askKitVersion(1500);
+    if (!v || v === KIT_VERSION) return v || KIT_VERSION;
+    const reg = await sw.getRegistration();
+    if (!reg) return v;
+    console.info(`Readout: the service worker has readkit ${v}; waiting for the one with ${KIT_VERSION}`);
+    try {
+      await reg.update();
+    } catch (e) {
+      return v; // offline: nothing newer is coming
+    }
+    const t0 = Date.now();
+    while (Date.now() - t0 < KIT_WAIT) {
+      if (!(reg.installing || reg.waiting || (reg.active && reg.active !== sw.controller))) break;
+      await new Promise((r) => {
+        const done = () => {
+          sw.removeEventListener('controllerchange', done);
+          clearTimeout(t);
+          r();
+        };
+        const t = setTimeout(done, 1000);
+        sw.addEventListener('controllerchange', done);
+      });
+      v = (await askKitVersion(1500)) || v;
+      if (v === KIT_VERSION) return v;
+    }
+    v = (await askKitVersion(1500)) || v;
+    if (v !== KIT_VERSION) console.warn(`Readout: going on with readkit ${v} from the service worker (this page is for ${KIT_VERSION})`);
+    return v;
+  }
+
+  // A worker with another readkit took over while the page runs (a release, another tab
+  // updated it): the parts of readkit not loaded yet would now come from the other version, so
+  // the page reloads, at once if it is hidden and idle, else when it next is, or on Reload.
+  function watchKitVersion() {
+    const sw = navigator.serviceWorker;
+    if (!sw || watchKitVersion.on) return;
+    watchKitVersion.on = true;
+    sw.addEventListener('controllerchange', async () => {
+      if (kit.stale || !kit.from) return;
+      const v = await askKitVersion(3000);
+      if (!v || v === kit.from) return;
+      kit.stale = true;
+      console.info(`Readout: updated to readkit ${v} while running ${kit.from}`);
+      if (document.visibilityState === 'hidden' && !appBusy()) reloadForUpdate();
+      else toast('Readout was updated. Reload to finish the update.', { action: 'Reload', onAction: reloadForUpdate, sticky: true });
+    });
+    document.addEventListener('visibilitychange', () => {
+      if (kit.stale && document.visibilityState === 'hidden' && !appBusy()) reloadForUpdate();
+    });
+  }
+
+  function reloadForUpdate() {
+    flushDocs();
+    location.reload();
+  }
+
+  // Never reload or interrupt in the middle of something: reading aloud, dictating, editing,
+  // a sheet, a question, a download or a file being read.
+  function appBusy() {
+    const asking = el.toastAction && !el.toast.hidden && !el.toastAction.hidden && toastHandler !== reloadForUpdate;
+    return tts.playing || dict.on || state.mode === 'edit' || !!document.querySelector('dialog[open]') || !!asking || !!au.dl || wake.reasons.size > 0;
   }
 
   function accent() {
@@ -204,7 +305,7 @@
   // Utterance-sized pieces of spoken text: readkit's, or (without readkit) up to 200
   // characters, cut at a space.
   function utterancePieces(text) {
-    if (kit.system) return kit.system.chunkText(text);
+    if (kit.K) return kit.K.chunkText(text);
     const out = [];
     let a = 0;
     while (a < text.length) {
@@ -1425,7 +1526,9 @@
       p.play();
       return;
     }
-    dropPlayer();
+    // (an ended player, or one for another text or voice: a new one starts below, so this
+    // isn't a stop)
+    dropPlayer({ keepState: true });
     let voice;
     try {
       [voice] = await Promise.all([ensureVoice(eng.id), playerModule()]);
@@ -1465,7 +1568,8 @@
     au.playerDoc = doc;
   }
 
-  function dropPlayer() {
+  // opts.keepState: a new player is about to start (playAudio), so reading goes on.
+  function dropPlayer(opts) {
     const p = au.player;
     if (!p) return;
     au.player = null;
@@ -1476,7 +1580,7 @@
     } catch (e) {
       /* ignore */
     }
-    if (tts.engine === 'audio' && tts.playing) {
+    if (tts.engine === 'audio' && tts.playing && !(opts && opts.keepState)) {
       tts.playing = false;
       onPlaybackStop();
     }
@@ -1605,10 +1709,12 @@
   const isAbort = (e) => !!e && (e.name === 'AbortError' || e.code === 'aborted');
 
   // Loads a downloaded voice (one at a time). The natural voice is checked on this device the
-  // first time (speed, and output a broken graphics driver would spoil).
-  async function ensureVoice(id) {
-    if (au.voice && au.voice.id === id) return au.voice;
-    if (au.loading && au.loading.id === id) return au.loading.promise;
+  // first time (speed, and output a broken graphics driver would spoil). opts.recheck (Check
+  // again): load it afresh and measure again, not readkit's stored result of the last check.
+  async function ensureVoice(id, opts) {
+    const recheck = !!(opts && opts.recheck);
+    if (au.voice && au.voice.id === id && !recheck) return au.voice;
+    if (au.loading && au.loading.id === id && (au.loading.recheck || !recheck)) return au.loading.promise;
     const V = await voiceModule();
     if (au.voice) {
       if (au.player) dropPlayer();
@@ -1625,7 +1731,7 @@
         setWaiting(`Checking ${entry.name} on this device…`);
         let cal;
         try {
-          cal = await voice.calibrate({ speed: 1 });
+          cal = await voice.calibrate({ speed: 1, force: recheck });
         } catch (e) {
           voice.dispose();
           throw e;
@@ -1638,7 +1744,7 @@
       }
       return voice;
     })();
-    const job = { id, promise };
+    const job = { id, promise, recheck };
     au.loading = job;
     try {
       const voice = await promise;
@@ -2303,14 +2409,17 @@
       askDownload(id);
       return;
     }
-    if (au.voice && au.voice.id === id) {
+    if ((au.voice && au.voice.id === id) || (au.loading && au.loading.id === id)) {
       pausePlayback();
       dropPlayer();
       stopPreview();
-      au.voice.dispose();
-      au.voice = null;
+      if (au.voice && au.voice.id === id) {
+        au.voice.dispose();
+        au.voice = null;
+      }
     }
-    ensureVoice(id)
+    // (measured again: readkit keeps the last check's result for this device and Chrome)
+    ensureVoice(id, { recheck: true })
       .then(() => {
         toast(`${voiceName(id)} works on this device.`);
         renderVoicePanel();
@@ -3050,15 +3159,15 @@
     if (!state.segs.length) return;
     toast('Collecting the audio…', { sticky: true });
     try {
-      const [V, P, C] = await Promise.all([voiceModule(), playerModule(), import('./readkit/src/audio/clipstore.js')]);
+      const [V, P] = await Promise.all([voiceModule(), playerModule()]);
       const entry = V.findVoice(eng.id);
-      const clips = C.openClipStore();
+      const clips = P.openClipStore();
       try {
         const now = au.player && au.voice && au.voice.id === eng.id ? au.player.generatedSpeed : P.snapSpeed(audioRate());
         const speeds = [...new Set([now, P.snapSpeed(audioRate()), 1, ...P.SPEEDS])];
         let best = null;
         for (const speed of speeds) {
-          const keys = await C.segmentKeys(state.segs, { engine: entry.engine, revision: entry.revision, voice: eng.id, speed });
+          const keys = await P.segmentKeys(state.segs, { engine: entry.engine, revision: entry.revision, voice: eng.id, speed });
           let have = 0;
           for (const k of keys) if (await clips.has(k)) have++;
           if (!best || have > best.have) best = { speed, keys, have };
@@ -4485,9 +4594,9 @@
         setTimeout(r, 4000);
       });
     }
-    // Never in the middle of something.
-    const busy = tts.playing || dict.on || state.mode === 'edit' || !!document.querySelector('dialog[open]') || (el.toastAction && !el.toast.hidden && !el.toastAction.hidden);
-    if (!navigator.serviceWorker.controller || busy) return false;
+    // Never in the middle of something (a voice download included: it would stop part way).
+    // Skipped, the next start is isolated anyway (the worker is in charge from the start then).
+    if (!navigator.serviceWorker.controller || appBusy()) return false;
     sessionStorage.setItem(COI_RELOAD, '1');
     flushDocs();
     location.reload();

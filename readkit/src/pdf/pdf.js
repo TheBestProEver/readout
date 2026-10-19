@@ -14,9 +14,10 @@ import { loadPdfjs, documentOptions } from './pdfjs.js';
 import { judgePage, quality, isJunkToken, core } from './quality.js';
 import { runsFromTextContent, segmentsOf, layoutPage, bandSegments, keysMatch, joinLines } from './layout.js';
 import { analyzeOps, isScanLayer } from './ops.js';
-import { renderPage, inkShare, toImage, freeCanvas, makeCanvas, paperShade } from './render.js';
+import { renderPage, inkShare, printLines, toImage, freeCanvas, makeCanvas, paperShade } from './render.js';
 import { ocrLines, correctLines, ocrSegments, patchRuns, shiftLines } from './ocrpage.js';
 import { fuseScan } from './scan.js';
+import { atomsFromSegments } from '../layout/layout.js';
 
 const WINDOW = 4; // pages either side compared when looking for running heads
 const OCR_BYTES = 5.5e6; // Tesseract core + English model + correction data, roughly
@@ -91,6 +92,7 @@ class PdfRun {
     this.warnedLayer = false;
     this.first = 1;
     this.last = 0;
+    this.layoutPages = opts.layout ? [] : null; // opts.layout: each page's segments, for src/layout
   }
 
   progress(stage, done, total, message) {
@@ -104,6 +106,12 @@ class PdfRun {
 
   warn(type, page, text) {
     this.warnings.push({ type, page, text });
+  }
+
+  // With opts.layout, the segments a page was laid out from, as positioned atoms.
+  capture(rec, segs, width, height, source) {
+    if (!this.layoutPages) return;
+    this.layoutPages.push({ page: rec.p, width, height, unit: 'pt', source, atoms: atomsFromSegments(segs) });
   }
 
   async run() {
@@ -167,7 +175,9 @@ class PdfRun {
     let words = 0;
     for (const b of this.blocks) if (!b.skip) words += b.text.split(/\s+/).filter(Boolean).length;
     this.stats.words = words;
-    return { title: title || '', blocks: this.blocks, warnings: this.warnings, stats: this.stats };
+    const out = { title: title || '', blocks: this.blocks, warnings: this.warnings, stats: this.stats };
+    if (this.layoutPages) out.layout = { pages: this.layoutPages };
+    return out;
   }
 
   async close() {
@@ -381,7 +391,7 @@ class PdfRun {
       return engine;
     } catch (e) {
       check(this.signal);
-      this.ocrState = { off: 'failed', reason: (e && e.message) || String(e) };
+      this.ocrState = { off: 'failed', reason: (e && e.message) || String(e), code: e && e.code };
       return null;
     }
   }
@@ -413,7 +423,9 @@ class PdfRun {
 
   ocrOffText(p, what) {
     const st = this.ocrState || {};
-    const why = st.off === 'never' ? 'OCR is turned off' : st.off === 'declined' ? 'OCR wasn’t allowed' : 'OCR isn’t available';
+    // (a Content Security Policy that blocks WebAssembly is named: the fix is the page's, not the file's)
+    const blocked = "OCR can’t start here (the Content Security Policy of this page or extension blocks WebAssembly; a Chrome extension needs 'wasm-unsafe-eval' in its content_security_policy)";
+    const why = st.off === 'never' ? 'OCR is turned off' : st.off === 'declined' ? 'OCR wasn’t allowed' : st.code === 'ocr-blocked' ? blocked : 'OCR isn’t available';
     return `Page ${p} ${what}, and ${why}, so it was skipped.`;
   }
 
@@ -585,8 +597,12 @@ class PdfRun {
           check(this.signal);
           return this.layoutText(rec, rec.frame.runs);
         }
-        const share = inkShare(r.canvas, r.scale, rec.upright ? rec.frame.runs : []);
-        if (share < INK) {
+        const boxes = rec.upright ? rec.frame.runs : [];
+        const share = inkShare(r.canvas, r.scale, boxes);
+        // A scan with one or two short lines of print (a chapter's last page) has too little
+        // ink to count, but its lines of strokes show; a blank scan has none.
+        const few = share < INK && rec.ops && rec.ops.maxImage >= 0.3 && printLines(r.canvas, r.scale, boxes).length > 0;
+        if (share < INK && !few) {
           freeCanvas(r.canvas);
           return this.layoutText(rec, rec.frame.runs);
         }
@@ -596,6 +612,7 @@ class PdfRun {
           return this.layoutText(rec, rec.frame.runs);
         }
         if (o.segs.length && o.quality.verdict !== 'garbage' && o.quality.content + o.quality.tokens > rec.judge.metrics.content + rec.judge.metrics.tokens) return this.layoutOcr(rec, o);
+        if (few) this.warn('ocr-low-confidence', p, `Page ${p} has a few lines of print that OCR couldn’t read.`);
         return this.layoutText(rec, rec.frame.runs);
       }
       case 'prefer': {
@@ -655,6 +672,7 @@ class PdfRun {
       const kept = r.words;
       const bodyFs = r.bodyFs;
       this.keys[p] = bandSegments(r.segs, rec.vpH, bodyFs).map((c) => ({ side: c.side, key: c.key }));
+      this.capture(rec, r.segs, rec.vpW, rec.vpH, o ? 'ocr' : 'text');
       const res = layoutPage(r.segs, this.ctxFor(rec, o ? 'ocr' : 'text', rec.vpH, { fs: bodyFs, bold: false }));
       if (dbg) {
         Object.assign(dbg, { bodyFs, kept, segs: r.segs, regions: r.regions, read: r.read, res: JSON.parse(JSON.stringify(res)) });
@@ -710,6 +728,7 @@ class PdfRun {
   layoutText(rec, runs, { scrub = false } = {}) {
     const segs = runs === rec.frame.runs && rec.segs ? rec.segs : segmentsOf(runs, this.bodyFs(), null);
     const body = { fs: this.bodyFs() || undefined, bold: this.bodyBold() };
+    this.capture(rec, segs, rec.frame.width, rec.frame.height, 'text');
     const res = layoutPage(segs, this.ctxFor(rec, 'text', rec.frame.height, body));
     if (scrub) {
       const dropped = [];
@@ -728,6 +747,7 @@ class PdfRun {
     sizes.sort((a, b) => a - b);
     const body = { fs: sizes.length ? sizes[sizes.length >> 1] : undefined, bold: false };
     this.keys[rec.p] = bandSegments(o.segs, rec.vpH, body.fs).map((c) => ({ side: c.side, key: c.key }));
+    this.capture(rec, o.segs, rec.vpW, rec.vpH, 'ocr');
     const res = layoutPage(o.segs, this.ctxFor(rec, 'ocr', rec.vpH, body));
     return this.tag(res, rec.p, 'ocr');
   }

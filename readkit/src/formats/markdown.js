@@ -36,6 +36,11 @@ function matchPairs(s, open, close) {
 
 const AUTOLINK = /<(?:(https?:\/\/[^\s<>]{1,2000})|(mailto:[^\s<>]{1,200})|([a-zA-Z][\w.+-]{0,63}@[\w.-]{1,253}))>/y;
 const TAG = /<\/?([a-zA-Z][a-zA-Z0-9-]{0,20})(?:\s[^<>]{0,500})?\/?>/y;
+// Raw HTML in Markdown (a README's <table>, <div align>, <details>): a block element's edges
+// break the line ('<td>Mon</td><td>Gym</td>' is not 'MonGym'); what a script, a style sheet or a
+// template holds is never text.
+const HTML_BREAK = /^(?:address|article|aside|blockquote|caption|center|dd|details|dialog|div|dl|dt|fieldset|figcaption|figure|footer|h[1-6]|header|hr|li|main|nav|ol|p|section|summary|table|tbody|td|tfoot|th|thead|tr|ul)$/i;
+const HTML_DROP = /^(?:script|style|template|noscript)$/i;
 const PUNCT_OR_SPACE = /[\s\p{P}\p{S}]/u;
 
 // Inline Markdown -> plain text in one pass. Emphasis delimiters are matched with a bounded
@@ -50,6 +55,7 @@ export function inlineText(src, depth = 0) {
   const label = (a, b) => (depth < 3 ? inlineText(s.slice(a, b), depth + 1) : s.slice(a, b));
   const lead = s.search(/\S/);
   let commentEnd = -2;
+  let lower = null; // s in lower case, made when first needed
   const out = [];
   const delims = []; // { idx in out, ch, len, canOpen, canClose }
   // Next code-span closer of each length, found by scanning backtick runs once.
@@ -180,7 +186,15 @@ export function inlineText(src, depth = 0) {
       TAG.lastIndex = i;
       const t = TAG.exec(s);
       if (t) {
-        if (/^br$/i.test(t[1])) out.push('\n');
+        if (HTML_DROP.test(t[1]) && t[0][1] !== '/') {
+          // to the end of the element (never closed: only the tag, the words after it may be prose)
+          if (lower === null) lower = s.toLowerCase();
+          const end = lower.indexOf('</' + t[1].toLowerCase(), i + t[0].length);
+          const gt = end < 0 ? -1 : s.indexOf('>', end);
+          i = gt < 0 ? i + t[0].length : gt + 1;
+          continue;
+        }
+        if (/^br$/i.test(t[1]) || HTML_BREAK.test(t[1])) out.push('\n');
         i += t[0].length;
         continue;
       }
@@ -320,6 +334,7 @@ export async function readMarkdown(md, ctx) {
 
   const lines = text.split('\n');
   const blocks = [];
+  let tables = 0;
   const notes = [];
   const counters = []; // ordered-list numbers by indent depth
   let para = null; // { type, lines }
@@ -380,6 +395,18 @@ export async function readMarkdown(md, ctx) {
       continue;
     }
     flushCode();
+    // a <script>, <style>, <template> or <noscript> block, blank lines and all, up to its end tag
+    const hb = /^ {0,3}<(script|style|template|noscript)(?=[\s>]|$)/i.exec(line);
+    if (hb) {
+      const close = '</' + hb[1].toLowerCase();
+      let end = n;
+      while (end < lines.length && !lines[end].toLowerCase().includes(close, end === n ? hb[0].length : 0)) end++;
+      if (end < lines.length) {
+        flush();
+        n = end;
+        continue;
+      }
+    }
     const f = FENCE.exec(line);
     if (f && !(f[1][0] === '`' && line.slice(f[0].length).includes('`'))) {
       flush();
@@ -416,11 +443,14 @@ export async function readMarkdown(md, ctx) {
     // Pipe table: a header row followed by a delimiter row.
     if (line.includes('|') && n + 1 < lines.length && isTableRule(lines[n + 1])) {
       flush();
-      for (const cell of splitRow(line)) if (cell) blocks.push(makeBlock('cell', inlineText(cell)));
+      const table = tables++;
+      let row = 0;
+      splitRow(line).forEach((cell, col) => cell && blocks.push(makeBlock('cell', inlineText(cell), { cell: { table, row, col } })));
       n++;
       while (n + 1 < lines.length && lines[n + 1].includes('|') && lines[n + 1].trim()) {
         n++;
-        for (const cell of splitRow(lines[n])) if (cell) blocks.push(makeBlock('cell', inlineText(cell)));
+        row++;
+        splitRow(lines[n]).forEach((cell, col) => cell && blocks.push(makeBlock('cell', inlineText(cell), { cell: { table, row, col } })));
       }
       continue;
     }

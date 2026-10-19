@@ -329,7 +329,10 @@ function finishSegment(s, stats) {
       if (!before) {
         s.marker = t; // a footnote's own number at the start of its first line
         text = t + ' ';
-      } else if (/(?:\p{L}{2}|[.,;:!?)\]"”’])$/u.test(before)) {
+      } else if (/^[23]$/.test(t) && (/\d\s?(?:[kcmµμnd]?m|ft|in|yd|mi)$/u.test(before) || /=\s*[\p{L}\p{N}]+$/u.test(before))) {
+        text = before + SUPER_DIGITS[t]; // a unit's or a formula's power: 12 km², 3 cm³, E = mc²
+      } else if (/(?:\p{L}{2}|[.,;:!?)\]"”’%])$/u.test(before) || /(?:^|\D)(?:1[5-9]\d\d|20\d\d)$/.test(before)) {
+        // (also after a percentage or a year: 'rose by 12%⁴', 'by 2030³')
         if (stats) stats.markers = (stats.markers || 0) + 1; // footnote reference: dropped
       } else if (/^\d+$/.test(t)) {
         text = before + [...t].map((c) => SUPER_DIGITS[c] || c).join(''); // an exponent: 10³, x²
@@ -1038,15 +1041,17 @@ function continues(prev, next) {
 }
 
 // Typical baseline-to-baseline distance as a multiple of the font size, from lines in
-// the same column that follow each other at the same size.
-function lineRatio(lines) {
+// the same column that follow each other at the same size. OCR'd sizes come from word
+// heights and wobble from line to line (descenders, capitals), so `tol` is wider there.
+function lineRatio(lines, tol = 0.05) {
   const r = [];
   for (let i = 1; i < lines.length; i++) {
     const a = lines[i - 1];
     const b = lines[i];
-    if (a.col !== b.col || Math.abs(a.fs - b.fs) > 0.05 * a.fs) continue;
+    if (a.col !== b.col || Math.abs(a.fs - b.fs) > tol * a.fs) continue;
+    const fs = (a.fs + b.fs) / 2;
     const pitch = b.base - a.base;
-    if (pitch > 0.85 * a.fs && pitch < 2.6 * a.fs) r.push(pitch / a.fs);
+    if (pitch > 0.85 * fs && pitch < 2.6 * fs) r.push(pitch / fs);
   }
   if (r.length < 3) return 0;
   // the most common pitch: paragraph gaps are the minority
@@ -1107,7 +1112,7 @@ function indentsSeen(lines, bounds) {
 export function linesToParagraphs(lines, ctx = {}) {
   const loose = !!ctx.loose || ctx.source === 'ocr';
   const bounds = columnBounds(lines);
-  const env = { ratio: lineRatio(lines), bounds, loose, indents: indentsSeen(lines, bounds) };
+  const env = { ratio: lineRatio(lines, loose ? 0.2 : 0.05), bounds, loose, indents: indentsSeen(lines, bounds) };
   const paras = [];
   let cur = null;
   const startPara = (l) => {
@@ -1162,13 +1167,17 @@ function breakBetween(P, L, cur, env) {
     // a bold heading line over body text, or the reverse
     if (P.bold >= 0.85 ? !SENTENCE_END.test(P.text) || cur.lines.length <= 2 : true) return true;
   }
-  // Extra space between lines.
+  // Extra space between lines. A sentence that runs on (no end on this line, a lowercase
+  // word or the rest of a broken word next) is one paragraph however loosely it is set:
+  // only a gap of about a blank line splits it (OCR'd pages at 1.6x spacing, and short
+  // pages with too few lines to measure the spacing).
   const pitch = L.base - P.base;
+  const runOn = (/^\p{Ll}/u.test(L.text) && !/[.!?…:]["”’')\]]*$/.test(P.text)) || (/\p{L}[-‐­]$/u.test(P.text) && /^\p{L}/u.test(L.text));
   if (ratio && !ocr) {
     if (pitch - ratio * fs > Math.max(0.2 * fs, 1.5)) return true;
   } else if (ratio && ocr) {
-    if (pitch - ratio * fs > 0.5 * fs) return true;
-  } else if (L.top - P.bot > 0.6 * fs) return true;
+    if (pitch - ratio * fs > (runOn ? 0.9 : 0.5) * fs) return true;
+  } else if (L.top - P.bot > (runOn ? 1.2 : 0.6) * fs) return true;
   const b = bounds.get(L.col) || { left: P.x0, right: P.x1 };
   const width = b.right - b.left;
   const tol = ocr ? 0.8 * fs : 0.5 * fs;
@@ -1275,9 +1284,78 @@ function centeredCaps(p, text, blk) {
 
 // Lays out one page's segments. ctx: { words, page, source, H, body: { fs, bold },
 // repeated: (side, key) => boolean }. Returns { body, headers, footers, notes }.
-export function layoutPage(segs, ctx) {
+// Line numbers in a gutter (pleading paper, a bill, a manuscript set with lineno): bare
+// numbers in a column outside the text block, each level with a line of text, counting up.
+// Not text: they would be read into the body ('... the rain continued. The 2 village ...'),
+// and the '1' at the top taken for a page number would take the first line with it as a
+// running head. A numbered list is not one: its numbers stand inside the text block.
+export function lineNumbers(segs, bodyFs) {
+  const nums = segs.filter((s) => /^\d{1,4}$/.test(s.text.trim()));
+  const text = segs.filter((s) => /\p{L}/u.test(s.text));
+  if (nums.length < 2 || !text.length) return new Set();
+  const left = Math.min(...text.map((s) => s.x0));
+  const right = Math.max(...text.map((s) => s.x1));
+  const level = (s) => text.some((o) => Math.abs(o.base - s.base) < 0.5 * Math.max(o.fs, s.fs));
+  const out = new Set();
+  for (const side of ['left', 'right']) {
+    const outside = nums.filter((s) => (side === 'left' ? s.x1 < left - 0.3 * bodyFs : s.x0 > right + 0.3 * bodyFs) && level(s));
+    // the biggest set sharing an edge (right-aligned or left-aligned numbers), within an em
+    let best = [];
+    for (const a of outside) {
+      for (const edge of ['x0', 'x1']) {
+        const g = outside.filter((b) => Math.abs(b[edge] - a[edge]) < Math.max(a.fs, bodyFs));
+        if (g.length > best.length) best = g;
+      }
+    }
+    if (best.length < 2) continue;
+    best.sort((a, b) => a.top - b.top);
+    const v = best.map((s) => +s.text.trim());
+    const steps = v.slice(1).map((x, i) => x - v[i]);
+    const up = steps.filter((d) => d > 0).length;
+    // (numbered every fifth or tenth line: two are enough, multiples of 5 a step apart)
+    const fives = steps.every((d) => d === steps[0]) && (steps[0] === 5 || steps[0] === 10) && v.every((x) => x % 5 === 0);
+    // they count lines: a line's height per step up (numbered paragraphs are further apart)
+    const per = steps.map((d, i) => (d > 0 ? (best[i + 1].base - best[i].base) / d : Infinity));
+    const pitch = median(per) <= 2.6 * bodyFs && per.filter((p) => p <= 4 * bodyFs).length >= 0.8 * per.length;
+    if (pitch && ((best.length >= 5 && up >= 0.8 * steps.length) || (best.length >= 3 && steps.every((d) => d === 1)) || fives)) for (const s of best) out.add(s);
+  }
+  return out;
+}
+
+// A segment that starts or ends with a bare number set well apart from its words (wider than a
+// word space, closer than a segment gap): the number and the words as two segments, for
+// lineNumbers().
+function numberPieces(segs) {
+  const bare = (r) => !!r && !r.sup && !r.sub && /^\d{1,4}$/.test(String(r.str).trim());
+  const piece = (s, runs) => {
+    const p = { runs, x0: Math.min(...runs.map((r) => r.x0)), x1: Math.max(...runs.map((r) => r.x1)), base: s.base, fs: s.fs, top: Math.min(...runs.map((r) => r.top)), bot: Math.max(...runs.map((r) => r.bot)) };
+    if (s.zone) p.zone = s.zone;
+    finishSegment(p, null);
+    return p;
+  };
+  let split = false;
+  const out = [];
+  for (const s of segs) {
+    const rs = s.runs || [];
+    const n = rs.length;
+    if (n > 1 && bare(rs[0]) && rs[1].x0 - rs[0].x1 > 0.6 * s.fs) out.push(piece(s, rs.slice(0, 1)), piece(s, rs.slice(1)));
+    else if (n > 1 && bare(rs[n - 1]) && rs[n - 1].x0 - rs[n - 2].x1 > 0.6 * s.fs) out.push(piece(s, rs.slice(0, -1)), piece(s, rs.slice(-1)));
+    else {
+      out.push(s);
+      continue;
+    }
+    split = true;
+  }
+  return split ? out : segs;
+}
+
+export function layoutPage(segs0, ctx) {
   const H = ctx.H;
-  const body = ctx.body || { fs: median(segs.map((s) => s.fs)), bold: false };
+  const body = ctx.body || { fs: median(segs0.map((s) => s.fs)), bold: false };
+  // a line-number gutter is left out before anything else (the pieces are used only then)
+  const pieces = numberPieces(segs0);
+  const gutter = lineNumbers(pieces, body.fs);
+  const segs = gutter.size ? pieces.filter((s) => !gutter.has(s)) : segs0;
   const used = new Set();
   const headers = [];
   const footers = [];

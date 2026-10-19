@@ -55,7 +55,7 @@ function makePdf(pages) {
 const SCAN = [
   ['The lighthouse keeper climbed the stairs', 'every evening before the sun went down.', 'He wiped the glass and lit the lamp,', 'then sat by the window with his tea.'],
   ['Ships passed in the dark, far from shore.', 'None of them knew his name, but all', 'of them trusted the light he kept.'],
-  // (readkit skips a scanned page with only a line or two of print as blank: notes/v2.md)
+  // (full pages; a page with only two lines has its own check below)
   ['Winter brought storms that shook the tower.', 'Still the lamp burned through the night.', 'The keeper wrote the weather in his book', 'and slept an hour before the dawn came.'],
   ['In spring a letter came from the mainland.', 'It thanked him for forty quiet years.', 'He read it twice beside the window', 'and kept it in the drawer with the others.'],
 ];
@@ -147,6 +147,13 @@ async function main() {
     const lower = t2.toLowerCase();
     check(['lighthouse', 'keeper', 'stairs', 'ships', 'trusted'].every((w) => lower.includes(w)), 'the words in the pictures are read', t2);
     check(/lit the lamp/i.test(t2.replace(/\s+/g, ' ')), 'accurately enough to read aloud', t2);
+
+    console.log('A scanned page with only two lines of print (the end of a chapter)');
+    // (readkit 0.1.0 took such a page for a blank one: no OCR, no warning, its text missing)
+    const shortEnd = makePdf([await scanPage(SCAN[3]), await scanPage(['He closed the logbook for the night.', 'The end.'])]);
+    await open(shortEnd, 'Chapter end.pdf');
+    const t5 = await waitDoc('Chapter end', 180000);
+    check(/mainland/i.test(t5) && /closed the logbook/i.test(t5.replace(/\s+/g, ' ')), 'its text is read too, not skipped as a blank page', t5);
 
     console.log('A photo of a page');
     const photo = Buffer.from(await phone.eval(`return T.page(${JSON.stringify(SCAN[2])}, 'image/png')`), 'base64');
