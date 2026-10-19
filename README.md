@@ -115,4 +115,4 @@ Tests (browser tests need Chrome or Edge and always run it headless with a tempo
 
 ## License
 
-MIT. readkit is MIT; its third-party data, libraries, and voice models keep their own licences (see `readkit/NOTICE.md`).
+Readout: all rights reserved (see `LICENSE`). The bundled readkit library (`readkit/`) is MIT; its third-party data, libraries, and voice models keep their own licences (see `readkit/NOTICE.md`).
